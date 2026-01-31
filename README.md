@@ -30,12 +30,13 @@ The model is trained on contemplative dialogues (primarily from Sri Ramana Mahar
 ├─────────────────────────────────────────────────────────────┤
 │                                                               │
 │  1. Data Preparation                                         │
-│     ├─ Parse contemplative texts (parse-talks.py)          │
+│     ├─ Parse Q / A record (parse-talks.py)                 │
 │     ├─ Filter corpus (filter_spgc_corpus.py)                │
-│     └─ Prepare training data (prepared_data/)              │
+│        (a selected set of non-conversational meditative texts from gutenberg.org. |
+|     └─ Prepare training data (prepared_data/)              │
 │                                                               │
 │  2. Continued Pretraining                                    │
-│     └─ LoRA fine-tuning on contemplative corpus             │
+│     └─ LoRA fine-tuning on non-conversational meditative corpus           │
 │        (continued-pretrain-lora.py)                         │
 │                                                               │
 │  3. Supervised Fine-Tuning (Optional)                       │
