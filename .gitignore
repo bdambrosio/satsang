@@ -206,3 +206,31 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ML Model Checkpoints and Weights
+phi2-contemplative/
+phi2-contemplative-lora/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# Data Directories
+prepared_data/
+filtered_guten/
+ramana/
+*.zip
+
+# Experiment Tracking
+wandb/
+*.wandb
+
+# IDE and Environment
+.vscode/
+.python-version
+
+# Large Text Files (if not needed in repo)
+Face_to_Face_with_Sri_Ramana_Maharshi.txt
+nan-yar.txt

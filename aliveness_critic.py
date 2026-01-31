@@ -35,15 +35,18 @@ Requirements:
 
 import json
 import logging
+import os
 import random
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+nan_yar=""""""
 
 # =============================================================================
 # CRITIC PROMPTS
@@ -181,6 +184,49 @@ class CriticResult:
     def needs_silence(self) -> bool:
         """Score so low that silence is better than any response."""
         return self.score < 3.0
+    
+    def display(self) -> str:
+        """Pretty-print the critic result."""
+        lines = []
+        lines.append("=" * 60)
+        lines.append("ALIVENESS CRITIC RESULT")
+        lines.append("=" * 60)
+        
+        # Score and status
+        status = "✓ ALIVE" if self.is_alive else "✗ STALE"
+        if self.needs_silence:
+            status = "⚠ SILENCE RECOMMENDED"
+        lines.append(f"Score: {self.score:.1f}/10.0  [{status}]")
+        lines.append("")
+        
+        # Alive signals
+        #if self.alive_signals:
+        #    lines.append("Alive Signals:")
+        #    for signal in self.alive_signals:
+        #        lines.append(f"  ✓ {signal}")
+        #    lines.append("")
+        
+        # Stale signals
+        #if self.stale_signals:
+        #    lines.append("Stale Signals:")
+        #    for signal in self.stale_signals:
+        #        lines.append(f"  ✗ {signal}")
+        #    lines.append("")
+        
+        # Reasoning
+        #if self.reasoning:
+        #    lines.append("Reasoning:")
+        #    lines.append(f"  {self.reasoning}")
+        #    lines.append("")
+        
+        # Suggestion
+        #if self.suggestion and self.suggestion.lower() != "none":
+        #    lines.append("Suggestion:")
+        #    lines.append(f"  {self.suggestion}")
+        #    lines.append("")
+        
+        #lines.append("=" * 60)
+        return "\n".join(lines)
 
 
 # =============================================================================
@@ -233,17 +279,23 @@ class LLMCritic(BaseCritic):
     ):
         self.provider = provider
         self.model = model
-        self.api_key = api_key
         self.threshold = threshold
         
-        # Initialize client based on provider
+        # Resolve API key from parameter or environment
         if provider == "anthropic":
+            if api_key is None:
+                # Try CLAUDE_API_KEY first (user's convention), then ANTHROPIC_API_KEY (standard)
+                api_key = os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+            self.api_key = api_key
             try:
                 import anthropic
                 self.client = anthropic.Anthropic(api_key=api_key)
             except ImportError:
                 raise ImportError("pip install anthropic")
         elif provider == "openai":
+            if api_key is None:
+                api_key = os.environ.get("OPENAI_API_KEY")
+            self.api_key = api_key
             try:
                 import openai
                 self.client = openai.OpenAI(api_key=api_key)
@@ -437,13 +489,13 @@ class ContemplativeGenerator:
     
     def __init__(
         self,
-        generator_url: str = "http://localhost:8001/v1",
-        generator_model: str = "contemplative-model",
+        generator_url: str = "http://localhost:5000/v1",
+        generator_model: Optional[str] = None,
         critic: Optional[BaseCritic] = None,
         config: Optional[GenerationConfig] = None,
+        auto_select_model: bool = True,
     ):
         self.generator_url = generator_url
-        self.generator_model = generator_model
         self.critic = critic
         self.config = config or GenerationConfig()
         
@@ -452,12 +504,63 @@ class ContemplativeGenerator:
             self.http_client = httpx.Client(timeout=120.0)
         except ImportError:
             raise ImportError("pip install httpx")
+        
+        # Auto-discover model if not provided or if auto_select_model is True
+        if generator_model is None or auto_select_model:
+            available_models = self.get_available_models()
+            if available_models:
+                self.generator_model = generator_model or available_models[0]
+                logger.info(f"Using model: {self.generator_model}")
+            elif generator_model is None:
+                raise ValueError(
+                    f"No models available at {generator_url} and no model specified. "
+                    f"Available models: {available_models}"
+                )
+            else:
+                self.generator_model = generator_model
+        else:
+            self.generator_model = generator_model
+        
+        # Load nan-yar.txt
+        script_dir = Path(__file__).parent
+        nan_yar_path = script_dir / "nan-yar.txt"
+        if nan_yar_path.exists():
+            with open(nan_yar_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.nan_yar = [line for line in content.split('\n') if line.strip()]
+        else:
+            logger.warning(f"nan-yar.txt not found at {nan_yar_path}")
+            self.nan_yar = []
     
-    def generate(
-        self,
-        user_input: str,
-        conversation_history: Optional[list[dict]] = None,
-    ) -> dict:
+    def get_available_models(self) -> list[str]:
+        """
+        Query the API for available models.
+        
+        Returns:
+            List of model IDs available at the generator_url.
+        """
+        try:
+            resp = self.http_client.get(f"{self.generator_url}/models")
+            resp.raise_for_status()
+            data = resp.json()
+            
+            # Handle OpenAI-compatible format: {"data": [{"id": "model1"}, ...]}
+            if "data" in data:
+                return [model["id"] for model in data["data"]]
+            # Handle alternative format: {"models": ["model1", "model2", ...]}
+            elif "models" in data:
+                return data["models"]
+            # Handle direct list: ["model1", "model2", ...]
+            elif isinstance(data, list):
+                return data
+            else:
+                logger.warning(f"Unexpected models endpoint format: {data}")
+                return []
+        except Exception as e:
+            logger.warning(f"Failed to fetch available models: {e}")
+            return []
+    
+    def generate(self, user_input: str, conversation_history: Optional[list[dict]] = None) -> dict:
         """
         Generate a response, using critic to filter staleness.
         
@@ -470,7 +573,11 @@ class ContemplativeGenerator:
                 "critic_results": list[CriticResult],
             }
         """
-        conversation_history = conversation_history or []
+        if conversation_history is None:
+            if self.nan_yar:
+                conversation_history = [{"role": "system", "content": random.choice(self.nan_yar)}]
+            else:
+                conversation_history = []
         critic_results = []
         best_response = None
         best_score = 0.0
@@ -480,11 +587,7 @@ class ContemplativeGenerator:
             temperature = self.config.temperature_base + (attempt * self.config.temperature_bump)
             
             # Generate candidate
-            candidate = self._generate_candidate(
-                user_input,
-                conversation_history,
-                temperature=temperature,
-            )
+            candidate = self._generate_candidate(user_input, conversation_history, temperature)
             
             if not candidate:
                 continue
@@ -494,7 +597,8 @@ class ContemplativeGenerator:
                 result = self.critic.evaluate(user_input, candidate)
                 critic_results.append(result)
                 
-                logger.info(f"Attempt {attempt + 1}: score={result.score:.1f}")
+                logger.info(f"Attempt {attempt + 1}: response={candidate[:80]}")
+                logger.info(f"   score={result.score:.1f}")
                 if result.stale_signals:
                     logger.debug(f"  Stale signals: {result.stale_signals[:3]}")
                 
@@ -611,23 +715,28 @@ or consider speaking with a therapist who specializes in existential concerns.""
     print("ALIVENESS CRITIC DEMONSTRATION")
     print("=" * 60)
     
+    critic = LLMCritic('anthropic', 'claude-sonnet-4-20250514', api_key=os.environ.get("CLAUDE_API_KEY"))
+    # Auto-discover available models from the generator API
+    generator = ContemplativeGenerator('http://localhost:5000/v1', critic=critic)
     for case in test_cases:
         print(f"\nUser: {case['user']}")
         print("-" * 40)
         
         # Check stale response
-        is_stale, markers = BaseCritic.quick_stale_check(None, case['stale'])
-        print(f"\nSTALE response:")
-        print(f"  {case['stale'][:100]}...")
-        print(f"  Quick check: {'STALE' if is_stale else 'unclear'}")
-        if markers:
-            print(f"  Markers: {markers[:3]}")
+        #analysis = critic.evaluate(case['user'], case['stale'])
+        #print(f"\nSTALE response:")
+        #print(f" {analysis.display()} \n    \n")      
         
         # Check alive response  
-        is_stale, markers = BaseCritic.quick_stale_check(None, case['alive'])
-        print(f"\nALIVE response:")
-        print(f"  {case['alive']}")
-        print(f"  Quick check: {'STALE' if is_stale else 'potentially alive'}")
+        #analysis = critic.evaluate(case['user'], case['alive'])
+        #print(f"\nALIVE response:")
+        #print(f" {analysis.display()} \n    \n")      
+        
+        # Check alive response  
+        generated_response = generator.generate(case['user'])['response']
+        print(f"Generated response: {generated_response}")
+        analysis = critic.evaluate(case['user'], generated_response)
+        print(f" {analysis.display()} \n    \n")      
         
         print()
 

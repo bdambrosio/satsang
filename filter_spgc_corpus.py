@@ -103,7 +103,7 @@ EXCLUDE_SUBJECTS = [
     'Love stories', 'Domestic fiction',
     
     # Children's literature
-    'Juvenile', 'Children', 'Young adult',
+    'Juvenile', 'Children', 'Young adult', 'Camp Fire', 'Girl Scouts',  'Boy Scouts', 'Boarding school',
     
     # Instrumental/prescriptive
     'Self-help', 'How-to', 'Handbooks', 'Manuals',
