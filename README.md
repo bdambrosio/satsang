@@ -2,6 +2,8 @@
 
 This project fine-tunes Microsoft's Phi-2 model to generate contemplative responses that resist the "closure reflex" — the habitual move toward resolution, helpfulness, and answer-giving that kills contemplative space.
 
+## This Readme is AI generated and has not been carefully reviewed. That will happen as the repo matures.
+
 ## The Problem: Why "Non-Conversational"?
 
 Most language models are trained to be helpful assistants. They:
@@ -20,7 +22,9 @@ Most language models are trained to be helpful assistants. They:
 - Uses minimal words—no more than the moment requires
 - Points rather than explains
 
-The model is trained on contemplative dialogues (primarily from Sri Ramana Maharshi) where responses create space rather than fill it.
+We start with Phi2 Base, the least 'conversational' readily available base model I know of (and small enough for experimentation)
+The model is Stage 2 pre-trained on a selected non-conversational spiritual subset of the gutenberg oss corpus (about 100M tokens).
+The model is post-trained on contemplative dialogues (primarily from Sri Ramana Maharshi).
 
 ## Architecture Overview
 
@@ -30,12 +34,13 @@ The model is trained on contemplative dialogues (primarily from Sri Ramana Mahar
 ├─────────────────────────────────────────────────────────────┤
 │                                                               │
 │  1. Data Preparation                                         │
-│     ├─ Parse contemplative texts (parse-talks.py)          │
+│     ├─ Parse Q / A record (parse-talks.py)                 │
 │     ├─ Filter corpus (filter_spgc_corpus.py)                │
-│     └─ Prepare training data (prepared_data/)              │
+│        (a selected set of non-conversational meditative texts from gutenberg.org. |
+|     └─ Prepare training data (prepared_data/)              │
 │                                                               │
 │  2. Continued Pretraining                                    │
-│     └─ LoRA fine-tuning on contemplative corpus             │
+│     └─ LoRA fine-tuning on non-conversational meditative corpus           │
 │        (continued-pretrain-lora.py)                         │
 │                                                               │
 │  3. Supervised Fine-Tuning (Optional)                       │
