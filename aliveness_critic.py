@@ -18,21 +18,34 @@ Architecture:
                                     [Return Response]
 
 Usage:
+    # Using HTTP API (default)
     from aliveness_critic import AlivenessCritic, ContemplativeGenerator
     
     critic = AlivenessCritic(model="openai/gpt-4", threshold=6.0)
     generator = ContemplativeGenerator(
-        model="local/your-finetuned-model",
+        generator_url="http://localhost:5000/v1",
         critic=critic,
-        max_attempts=3
+    )
+    
+    # Using local inference provider
+    from phi2_contemplative_inference_lora import Phi2InferenceProvider
+    
+    provider = Phi2InferenceProvider(
+        base_model_name="microsoft/phi-2",
+        checkpoint_dir=Path("./phi2-contemplative-lora/checkpoint-4000")
+    )
+    generator = ContemplativeGenerator(
+        inference_provider=provider,
+        critic=critic,
     )
     
     response = generator.generate("I feel lost in my practice.")
 
 Requirements:
-    pip install openai anthropic httpx
+    pip install openai anthropic httpx torch transformers peft
 """
 
+import argparse
 import json
 import logging
 import os
@@ -45,6 +58,21 @@ from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Optional import for local inference provider
+try:
+    import importlib.util
+    inference_module_path = Path(__file__).parent / "phi2-contemplative-inference-lora.py"
+    if inference_module_path.exists():
+        spec = importlib.util.spec_from_file_location("phi2_inference", inference_module_path)
+        phi2_inference = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(phi2_inference)
+        Phi2InferenceProvider = phi2_inference.Phi2InferenceProvider
+    else:
+        Phi2InferenceProvider = None
+except Exception as e:
+    Phi2InferenceProvider = None
+    logger.debug(f"Phi2InferenceProvider not available: {e}")
 
 nan_yar=""""""
 
@@ -494,32 +522,50 @@ class ContemplativeGenerator:
         critic: Optional[BaseCritic] = None,
         config: Optional[GenerationConfig] = None,
         auto_select_model: bool = True,
+        inference_provider=None,  # Optional Phi2InferenceProvider instance
     ):
+        self.inference_provider = inference_provider
         self.generator_url = generator_url
         self.critic = critic
         self.config = config or GenerationConfig()
         
-        try:
-            import httpx
-            self.http_client = httpx.Client(timeout=120.0)
-        except ImportError:
-            raise ImportError("pip install httpx")
-        
-        # Auto-discover model if not provided or if auto_select_model is True
-        if generator_model is None or auto_select_model:
-            available_models = self.get_available_models()
-            if available_models:
-                self.generator_model = generator_model or available_models[0]
-                logger.info(f"Using model: {self.generator_model}")
-            elif generator_model is None:
+        if inference_provider is not None:
+            if Phi2InferenceProvider is None:
                 raise ValueError(
-                    f"No models available at {generator_url} and no model specified. "
-                    f"Available models: {available_models}"
+                    "inference_provider provided but Phi2InferenceProvider not available. "
+                    "Ensure phi2-contemplative-inference-lora.py is in the same directory."
                 )
+            if not isinstance(inference_provider, Phi2InferenceProvider):
+                raise ValueError(f"inference_provider must be a Phi2InferenceProvider instance")
+        
+        if inference_provider is None:
+            # Use HTTP API (backward compatible)
+            try:
+                import httpx
+                self.http_client = httpx.Client(timeout=120.0)
+            except ImportError:
+                raise ImportError("pip install httpx")
+            
+            # Auto-discover model if not provided or if auto_select_model is True
+            if generator_model is None or auto_select_model:
+                available_models = self.get_available_models()
+                if available_models:
+                    self.generator_model = generator_model or available_models[0]
+                    logger.info(f"Using model: {self.generator_model}")
+                elif generator_model is None:
+                    raise ValueError(
+                        f"No models available at {generator_url} and no model specified. "
+                        f"Available models: {available_models}"
+                    )
+                else:
+                    self.generator_model = generator_model
             else:
                 self.generator_model = generator_model
         else:
-            self.generator_model = generator_model
+            # Using local inference provider
+            self.http_client = None
+            self.generator_model = None
+            logger.info("Using local inference provider")
         
         # Load nan-yar.txt
         script_dir = Path(__file__).parent
@@ -656,6 +702,20 @@ class ContemplativeGenerator:
         
         messages = history + [{"role": "user", "content": user_input}]
         
+        # Use local inference provider if available
+        if self.inference_provider is not None:
+            try:
+                return self.inference_provider.generate_from_messages(
+                    messages=messages,
+                    max_new_tokens=300,
+                    temperature=temperature,
+                    do_sample=True,
+                )
+            except Exception as e:
+                logger.warning(f"Local generation failed: {e}")
+                return None
+        
+        # Fallback to HTTP API
         try:
             resp = self.http_client.post(
                 f"{self.generator_url}/chat/completions",
@@ -678,68 +738,176 @@ class ContemplativeGenerator:
 # EXAMPLE USAGE
 # =============================================================================
 
-def example_usage():
-    """Demonstrate the critic system."""
+def example_usage(
+    checkpoint_dir: Optional[str] = None,
+    base_model: str = "microsoft/phi-2",
+    critic_provider: str = "anthropic",
+    critic_model: str = "claude-sonnet-4-20250514",
+    test_prompts: Optional[list[str]] = None,
+):
+    """
+    Run the aliveness critic system with a local SFT model.
+    
+    Args:
+        checkpoint_dir: Path to SFT output checkpoint (e.g., "./sft_output/final")
+        base_model: Base model name (only used if checkpoint doesn't specify it)
+        critic_provider: Critic provider ("anthropic" or "openai")
+        critic_model: Critic model name
+        test_prompts: List of prompts to test (defaults to built-in examples)
+    """
+    import argparse
     
     # Example responses to evaluate
-    test_cases = [
-        {
-            "user": "I feel stuck in my meditation practice.",
-            "stale": """I understand how frustrating that can be. Here are some suggestions:
-1. Try varying your technique
-2. Consider joining a meditation group  
-3. Be patient with yourself - progress isn't always linear
-Remember, the journey is just as important as the destination.""",
-            "alive": "What does 'stuck' feel like?"
-        },
-        {
-            "user": "What should I do with my life?",
-            "stale": """That's a profound question that many people struggle with. I'd recommend:
-- Reflecting on your core values
-- Exploring what brings you joy
-- Consider talking to a career counselor or life coach
-The key is to align your actions with your authentic self.""",
-            "alive": "Who is asking?"
-        },
-        {
-            "user": "I'm afraid of death.",
-            "stale": """Fear of death is completely natural and something humans have grappled with 
-throughout history. You might find comfort in exploring philosophical perspectives on mortality,
-or consider speaking with a therapist who specializes in existential concerns.""",
-            "alive": "Yes."
-        },
-    ]
+    if test_prompts is None:
+        test_prompts = [
+            "I feel stuck in my meditation practice.",
+            "What should I do with my life?",
+            "I'm afraid of death.",
+        ]
     
-    # Create a mock critic for demonstration
     print("=" * 60)
-    print("ALIVENESS CRITIC DEMONSTRATION")
+    print("ALIVENESS CRITIC EVALUATION")
     print("=" * 60)
     
-    critic = LLMCritic('anthropic', 'claude-sonnet-4-20250514', api_key=os.environ.get("CLAUDE_API_KEY"))
-    # Auto-discover available models from the generator API
-    generator = ContemplativeGenerator('http://localhost:5000/v1', critic=critic)
-    for case in test_cases:
-        print(f"\nUser: {case['user']}")
-        print("-" * 40)
+    # Setup critic
+    api_key = None
+    if critic_provider == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
+    elif critic_provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+    
+    if not api_key:
+        raise ValueError(f"API key not found. Set {critic_provider.upper()}_API_KEY environment variable.")
+    
+    critic = LLMCritic(critic_provider, critic_model, api_key=api_key)
+    
+    # Setup generator with local inference provider
+    if checkpoint_dir:
+        if Phi2InferenceProvider is None:
+            raise ValueError(
+                "Phi2InferenceProvider not available. "
+                "Ensure phi2-contemplative-inference-lora.py is in the same directory."
+            )
         
-        # Check stale response
-        #analysis = critic.evaluate(case['user'], case['stale'])
-        #print(f"\nSTALE response:")
-        #print(f" {analysis.display()} \n    \n")      
+        checkpoint_path = Path(checkpoint_dir)
+        if not checkpoint_path.exists():
+            raise ValueError(f"Checkpoint directory not found: {checkpoint_dir}")
         
-        # Check alive response  
-        #analysis = critic.evaluate(case['user'], case['alive'])
-        #print(f"\nALIVE response:")
-        #print(f" {analysis.display()} \n    \n")      
+        logger.info(f"Loading inference provider from checkpoint: {checkpoint_dir}")
+        provider = Phi2InferenceProvider(
+            base_model_name=base_model,
+            checkpoint_dir=checkpoint_path,
+        )
+        generator = ContemplativeGenerator(
+            inference_provider=provider,
+            critic=critic,
+        )
+    else:
+        # Fallback to HTTP API
+        logger.warning("No checkpoint_dir provided, using HTTP API (http://localhost:5000/v1)")
+        generator = ContemplativeGenerator(
+            generator_url="http://localhost:5000/v1",
+            critic=critic,
+        )
+    
+    # Run evaluation
+    for i, prompt in enumerate(test_prompts, 1):
+        print(f"\n[{i}/{len(test_prompts)}] User: {prompt}")
+        print("-" * 60)
         
-        # Check alive response  
-        generated_response = generator.generate(case['user'])['response']
+        result = generator.generate(prompt)
+        generated_response = result['response']
+        attempts = result['attempts']
+        final_score = result['final_score']
+        
         print(f"Generated response: {generated_response}")
-        analysis = critic.evaluate(case['user'], generated_response)
-        print(f" {analysis.display()} \n    \n")      
+        print(f"Attempts: {attempts}, Final score: {final_score:.1f}")
+        
+        if result['critic_results']:
+            print(f"\nCritic analysis:")
+            print(result['critic_results'][-1].display())
         
         print()
 
 
+def main():
+    """Command-line interface for aliveness critic."""
+    parser = argparse.ArgumentParser(
+        description="Evaluate contemplative model responses using aliveness critic",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Use SFT output model
+  python aliveness_critic.py --checkpoint ./sft_output/final
+  
+  # Use specific checkpoint
+  python aliveness_critic.py --checkpoint ./sft_output/checkpoint-27
+  
+  # Use custom prompts file
+  python aliveness_critic.py --checkpoint ./sft_output/final --prompts eval_prompts.txt
+  
+  # Use OpenAI critic instead of Anthropic
+  python aliveness_critic.py --checkpoint ./sft_output/final --critic-provider openai --critic-model gpt-4
+        """
+    )
+    
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to SFT output checkpoint directory (e.g., ./sft_output/final). "
+             "If not provided, uses HTTP API at http://localhost:5000/v1"
+    )
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        default="microsoft/phi-2",
+        help="Base model name (only used if checkpoint doesn't specify it in adapter_config.json)"
+    )
+    parser.add_argument(
+        "--critic-provider",
+        type=str,
+        default="anthropic",
+        choices=["anthropic", "openai"],
+        help="Critic provider (default: anthropic)"
+    )
+    parser.add_argument(
+        "--critic-model",
+        type=str,
+        default="claude-sonnet-4-20250514",
+        help="Critic model name (default: claude-sonnet-4-20250514)"
+    )
+    parser.add_argument(
+        "--prompts",
+        type=str,
+        default=None,
+        help="Path to file with test prompts (one per line). If not provided, uses built-in examples."
+    )
+    
+    args = parser.parse_args()
+    
+    # Load prompts if provided
+    test_prompts = None
+    if args.prompts:
+        prompts_path = Path(args.prompts)
+        if prompts_path.exists():
+            with open(prompts_path, 'r') as f:
+                test_prompts = [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.lstrip().startswith("#")
+                ]
+        else:
+            logger.warning(f"Prompts file not found: {args.prompts}, using built-in examples")
+    
+    example_usage(
+        checkpoint_dir=args.checkpoint,
+        base_model=args.base_model,
+        critic_provider=args.critic_provider,
+        critic_model=args.critic_model,
+        test_prompts=test_prompts,
+    )
+
+
 if __name__ == "__main__":
-    example_usage()
+    main()

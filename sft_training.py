@@ -7,7 +7,13 @@ Fine-tunes a merged Phi-2 base model on contemplative Q&A dialogues
 using LoRA targeting upper transformer layers.
 
 Usage:
-    python sft_training.py --model_path /path/to/merged/model --data_path /path/to/data.jsonl
+    # Basic usage (train on base model)
+    python sft_training.py --model_path /path/to/base/model --data_path /path/to/data.jsonl
+    
+    # Load LoRA checkpoint, merge, then train
+    python sft_training.py --model_path microsoft/phi-2 \
+        --checkpoint phi2-contemplative-lora/checkpoint-2250 \
+        --data_path /path/to/data.jsonl
 
 Requirements:
     pip install torch transformers trl peft datasets accelerate
@@ -32,6 +38,33 @@ from trl import SFTTrainer, SFTConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _safe_model_id_for_path(model_path: str) -> str:
+    # Hugging Face IDs like "microsoft/phi-2" become a filesystem-friendly name.
+    return model_path.replace("/", "_").replace(":", "_")
+
+
+def _patch_adapter_config_base_model(output_dir: Path, merged_base_model_path: Path) -> int:
+    """
+    Update PEFT adapter_config.json files under output_dir to point at merged_base_model_path.
+    This ensures inference loads the correct merged base before applying the SFT LoRA adapter.
+    """
+    merged_base_str = str(merged_base_model_path.resolve())
+    patched = 0
+    for cfg_path in output_dir.rglob("adapter_config.json"):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("base_model_name_or_path") != merged_base_str:
+                cfg["base_model_name_or_path"] = merged_base_str
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                patched += 1
+        except Exception as e:
+            logger.warning(f"Could not patch {cfg_path}: {e}")
+    return patched
 
 
 # =============================================================================
@@ -100,6 +133,72 @@ def prepare_dataset(data_path: str, val_split: float = 0.1) -> tuple[Dataset, Da
 # MODEL SETUP
 # =============================================================================
 
+def _load_lora_checkpoint(base_model, checkpoint_dir: Path):
+    """
+    Load LoRA adapter with key remapping to handle torch.compile artifacts.
+    
+    Same logic as inference script to ensure compatibility.
+    """
+    from peft import PeftModel, LoraConfig, get_peft_model
+    from safetensors.torch import load_file
+    import json
+    
+    # Load adapter config
+    config_path = checkpoint_dir / "adapter_config.json"
+    if not config_path.exists():
+        raise ValueError(f"Adapter config not found at {config_path}")
+    
+    with open(config_path) as f:
+        adapter_config = json.load(f)
+    
+    # Create LoRA config and wrap base model
+    lora_config = LoraConfig(
+        r=adapter_config["r"],
+        lora_alpha=adapter_config["lora_alpha"],
+        target_modules=adapter_config["target_modules"],
+        lora_dropout=adapter_config.get("lora_dropout", 0.0),
+        bias=adapter_config.get("bias", "none"),
+        task_type=adapter_config.get("task_type", "CAUSAL_LM"),
+    )
+    model = get_peft_model(base_model, lora_config)
+    
+    # Load checkpoint weights
+    ckpt_path = checkpoint_dir / "adapter_model.safetensors"
+    if not ckpt_path.exists():
+        ckpt_path = checkpoint_dir / "adapter_model.bin"
+        if not ckpt_path.exists():
+            raise ValueError(f"Adapter weights not found at {checkpoint_dir}")
+        state_dict = torch.load(ckpt_path, map_location="cpu")
+    else:
+        state_dict = load_file(str(ckpt_path))
+    
+    # Remap keys (handle torch.compile artifacts)
+    remapped_state = {}
+    for key, value in state_dict.items():
+        new_key = key
+        # Remove _orig_mod. prefix (from torch.compile)
+        new_key = new_key.replace("_orig_mod.", "")
+        # Ensure base_model. prefix exists (PEFT wraps model as base_model.model)
+        if not new_key.startswith("base_model."):
+            new_key = "base_model." + new_key
+        # Add .default. to lora keys if missing
+        if ".lora_A.weight" in new_key and ".default." not in new_key:
+            new_key = new_key.replace(".lora_A.weight", ".lora_A.default.weight")
+        if ".lora_B.weight" in new_key and ".default." not in new_key:
+            new_key = new_key.replace(".lora_B.weight", ".lora_B.default.weight")
+        remapped_state[new_key] = value
+    
+    # Load state dict
+    missing, unexpected = model.load_state_dict(remapped_state, strict=False)
+    
+    if missing:
+        lora_missing = [k for k in missing if "lora" in k]
+        if lora_missing:
+            logger.warning(f"Missing LoRA keys: {len(lora_missing)} (showing first 3: {lora_missing[:3]})")
+    
+    return model
+
+
 def setup_model_and_tokenizer(
     model_path: str,
     lora_rank: int = 16,
@@ -108,23 +207,28 @@ def setup_model_and_tokenizer(
     target_upper_layers: bool = True,
     num_layers: int = 32,  # Phi-2 has 32 layers
     upper_fraction: float = 1/3,  # Target top third
+    lora_checkpoint: Optional[Path] = None,
+    merged_model_output: Optional[Path] = None,
 ):
     """
     Load model and apply LoRA configuration.
     
     Args:
-        model_path: Path to merged base model
-        lora_rank: LoRA rank
-        lora_alpha: LoRA alpha (scaling factor)
+        model_path: Path to base model (or merged model)
+        lora_rank: LoRA rank for new LoRA (if not loading checkpoint)
+        lora_alpha: LoRA alpha for new LoRA (if not loading checkpoint)
         lora_dropout: Dropout for LoRA layers
         target_upper_layers: If True, only apply LoRA to upper layers
         num_layers: Total number of transformer layers
         upper_fraction: Fraction of upper layers to target
+        lora_checkpoint: Optional path to LoRA checkpoint to load and merge
+        merged_model_output: Optional path to save merged model (if checkpoint provided)
     
     Returns:
-        (model, tokenizer)
+        (model, tokenizer, merged_model_path)
+        merged_model_path is None if no checkpoint was merged, otherwise the path where merged model was saved
     """
-    logger.info(f"Loading model from {model_path}")
+    logger.info(f"Loading base model from {model_path}")
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -144,14 +248,70 @@ def setup_model_and_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load model
+    # Fix Phi-2 config compatibility (pad_token_id may not exist)
+    from transformers import AutoConfig
+    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    if not hasattr(model_config, 'pad_token_id') or model_config.pad_token_id is None:
+        model_config.pad_token_id = model_config.eos_token_id
+        logger.info(f"Set pad_token_id to eos_token_id ({model_config.eos_token_id})")
+    
+    # Try flash_attention_2, fallback to sdpa if not available
+    attn_impl = "sdpa"
+    try:
+        import flash_attn
+        attn_impl = "flash_attention_2"
+        logger.info("Using flash_attention_2")
+    except ImportError:
+        logger.info("flash_attention_2 not available, using sdpa")
+    
+    # Load base model
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
+        config=model_config,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
         device_map="auto",
-        attn_implementation="flash_attention_2",  # Remove if not available
+        attn_implementation=attn_impl,
     )
+    
+    merged_model_path = None
+    
+    # If checkpoint provided, load LoRA, merge, and save
+    if lora_checkpoint is not None:
+        checkpoint_path = Path(lora_checkpoint)
+        logger.info(f"Loading LoRA checkpoint from {checkpoint_path}")
+        
+        # Load LoRA adapter
+        peft_model = _load_lora_checkpoint(model, checkpoint_path)
+        
+        # Merge LoRA into base model
+        logger.info("Merging LoRA adapter into base model...")
+        merged_model = peft_model.merge_and_unload()
+        
+        # Determine output path for merged model
+        if merged_model_output is None:
+            # Extract checkpoint name (e.g., "checkpoint-2250" from "phi2-contemplative-lora/checkpoint-2250")
+            checkpoint_name = checkpoint_path.name
+            merged_model_path = Path(model_path).parent / f"{Path(model_path).stem}_{checkpoint_name}_merged"
+        else:
+            merged_model_path = Path(merged_model_output)
+        
+        merged_model_path.mkdir(parents=True, exist_ok=True)
+        
+        # Save merged model
+        logger.info(f"Saving merged model to {merged_model_path}")
+        merged_model.save_pretrained(str(merged_model_path))
+        tokenizer.save_pretrained(str(merged_model_path))
+
+        # Make future PEFT adapters record the merged model as their base.
+        merged_base_str = str(merged_model_path.resolve())
+        try:
+            merged_model.config._name_or_path = merged_base_str
+        except Exception:
+            pass
+        
+        # Use merged model for further training
+        model = merged_model
     
     # Calculate which layers to target
     if target_upper_layers:
@@ -173,11 +333,11 @@ def setup_model_and_tokenizer(
         layers_to_transform=layers_to_transform,
     )
     
-    # Apply LoRA
+    # Apply new LoRA on top of (possibly merged) model
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     
-    return model, tokenizer
+    return model, tokenizer, merged_model_path
 
 
 # =============================================================================
@@ -307,6 +467,9 @@ def train(
     lora_rank: int = 16,
     lora_alpha: int = 32,
     target_upper_layers: bool = True,
+    # Checkpoint loading
+    lora_checkpoint: Optional[str] = None,
+    merged_model_output: Optional[str] = None,
     # Training params
     num_epochs: int = 3,
     batch_size: int = 4,
@@ -322,12 +485,14 @@ def train(
     Run SFT training.
     
     Args:
-        model_path: Path to merged base model
+        model_path: Path to base model (or merged model)
         data_path: Path to JSONL training data
         output_dir: Where to save checkpoints
-        lora_rank: LoRA rank
-        lora_alpha: LoRA alpha
+        lora_rank: LoRA rank for new LoRA adapter
+        lora_alpha: LoRA alpha for new LoRA adapter
         target_upper_layers: Only apply LoRA to upper third of layers
+        lora_checkpoint: Optional path to LoRA checkpoint to load and merge before training
+        merged_model_output: Optional path to save merged model (default: {model_path}_{checkpoint_name}_merged)
         num_epochs: Number of training epochs
         batch_size: Per-device batch size
         gradient_accumulation_steps: Gradient accumulation
@@ -342,12 +507,26 @@ def train(
     train_dataset, val_dataset = prepare_dataset(data_path)
     
     # Setup model
-    model, tokenizer = setup_model_and_tokenizer(
+    checkpoint_path = Path(lora_checkpoint) if lora_checkpoint else None
+    merged_output_path = Path(merged_model_output) if merged_model_output else None
+    if checkpoint_path is not None and merged_output_path is None:
+        merged_output_path = (
+            Path(output_dir)
+            / "merged_models"
+            / f"{_safe_model_id_for_path(model_path)}_{checkpoint_path.name}_merged"
+        )
+    
+    model, tokenizer, merged_path = setup_model_and_tokenizer(
         model_path,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         target_upper_layers=target_upper_layers,
+        lora_checkpoint=checkpoint_path,
+        merged_model_output=merged_output_path,
     )
+    
+    if merged_path:
+        logger.info(f"Merged model saved to {merged_path}. Using merged model for SFT training.")
     
     # Training config
     training_args = SFTConfig(
@@ -367,7 +546,7 @@ def train(
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         bf16=True,
-        max_seq_length=max_seq_length,
+        max_length=max_seq_length,  # SFTConfig uses max_length, not max_seq_length
         packing=False,  # Set True if you want sequence packing
         dataset_text_field=None,  # We're using messages format
     )
@@ -407,6 +586,11 @@ def train(
     trainer.save_model(final_path)
     tokenizer.save_pretrained(final_path)
     logger.info(f"Saved final model to {final_path}")
+
+    # Ensure all saved adapter configs under output_dir point at the merged base.
+    if merged_path:
+        patched = _patch_adapter_config_base_model(Path(output_dir), merged_path)
+        logger.info(f"Patched {patched} adapter_config.json files to use merged base: {merged_path.resolve()}")
     
     return trainer
 
@@ -420,13 +604,19 @@ def main():
     
     # Required
     parser.add_argument("--model_path", type=str, required=True,
-                        help="Path to merged base model")
+                        help="Path to base model (or merged model)")
     parser.add_argument("--data_path", type=str, required=True,
                         help="Path to JSONL training data")
     
     # Output
     parser.add_argument("--output_dir", type=str, default="./sft_output",
                         help="Output directory for checkpoints")
+    
+    # LoRA checkpoint loading
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to LoRA checkpoint to load and merge before training")
+    parser.add_argument("--merged_model_output", type=str, default=None,
+                        help="Path to save merged model (default: {model_path}_{checkpoint_name}_merged)")
     
     # LoRA
     parser.add_argument("--lora_rank", type=int, default=16)
@@ -467,6 +657,8 @@ def main():
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         target_upper_layers=not args.all_layers,
+        lora_checkpoint=args.checkpoint,
+        merged_model_output=args.merged_model_output,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,

@@ -118,6 +118,69 @@ DEFAULT_CONFIG = {
 # HELPER FUNCTIONS
 # =============================================================================
 
+def _load_peft_with_key_remap(base_model, peft_config, checkpoint_dir: Path):
+    """
+    Load PEFT adapter with key remapping to handle torch.compile artifacts.
+    
+    The checkpoint may have keys like:
+        _orig_mod.base_model.model.model.layers.0.mlp.fc1.lora_A.weight
+    
+    But PEFT expects:
+        base_model.model.model.layers.0.mlp.fc1.lora_A.default.weight
+    """
+    from peft import get_peft_model
+    from safetensors.torch import load_file
+    
+    # Create fresh PEFT model
+    model = get_peft_model(base_model, peft_config)
+    
+    # Load checkpoint weights
+    ckpt_path = checkpoint_dir / "adapter_model.safetensors"
+    if not ckpt_path.exists():
+        ckpt_path = checkpoint_dir / "adapter_model.bin"
+        state_dict = torch.load(ckpt_path, map_location="cpu")
+    else:
+        state_dict = load_file(str(ckpt_path))
+    
+    # Remap keys
+    remapped_state = {}
+    for key, value in state_dict.items():
+        new_key = key
+        # Remove _orig_mod. prefix (from torch.compile)
+        new_key = new_key.replace("_orig_mod.", "")
+        # Ensure base_model. prefix exists (PEFT wraps model as base_model.model)
+        if not new_key.startswith("base_model."):
+            new_key = "base_model." + new_key
+        # Add .default. to lora keys if missing
+        if ".lora_A.weight" in new_key and ".default." not in new_key:
+            new_key = new_key.replace(".lora_A.weight", ".lora_A.default.weight")
+        if ".lora_B.weight" in new_key and ".default." not in new_key:
+            new_key = new_key.replace(".lora_B.weight", ".lora_B.default.weight")
+        remapped_state[new_key] = value
+    
+    # Debug: show sample keys
+    sample_keys = list(remapped_state.keys())[:2]
+    logger.info(f"Remapped checkpoint keys (sample): {sample_keys}")
+    
+    # Get expected keys from model
+    model_state = model.state_dict()
+    expected_keys = [k for k in model_state.keys() if "lora_" in k][:2]
+    logger.info(f"Model expects keys (sample): {expected_keys}")
+    
+    # Load with strict=False to allow partial loading
+    missing, unexpected = model.load_state_dict(remapped_state, strict=False)
+    
+    # Filter to only LoRA-related missing keys
+    lora_missing = [k for k in missing if "lora_" in k]
+    if lora_missing:
+        logger.warning(f"Missing LoRA keys after remap: {len(lora_missing)} keys")
+        logger.warning(f"Sample missing: {lora_missing[:3]}")
+    else:
+        logger.info("All LoRA weights loaded successfully")
+    
+    return model
+
+
 def discover_target_modules_deprecated(model):
     """
     Discover actual module names in Phi-2 for LoRA targeting.
@@ -311,6 +374,7 @@ def train(
         AutoTokenizer,
         AutoConfig,
         Trainer,
+        TrainerCallback,
         TrainingArguments,
         DataCollatorForLanguageModeling,
     )
@@ -434,7 +498,7 @@ def train(
         target_modules = lora_cfg["target_modules"]
         logger.info(f"Using provided target modules: {target_modules}")
     
-    # Apply LoRA
+    # Apply LoRA - different path for fresh start vs resume
     logger.info(f"Applying LoRA with r={lora_cfg['r']}, alpha={lora_cfg['lora_alpha']}")
     
     peft_config = LoraConfig(
@@ -446,7 +510,19 @@ def train(
         task_type=TaskType.CAUSAL_LM,
     )
     
-    model = get_peft_model(model, peft_config)
+    if resume_from is not None:
+        # Resuming: Load adapter with key remapping to handle torch.compile artifacts
+        checkpoint_path = Path(resume_from)
+        adapter_path = checkpoint_path / "adapter_model.safetensors"
+        if adapter_path.exists() or (checkpoint_path / "adapter_config.json").exists():
+            logger.info(f"Resuming from PEFT checkpoint: {resume_from}")
+            model = _load_peft_with_key_remap(model, peft_config, checkpoint_path)
+        else:
+            logger.warning(f"Checkpoint {resume_from} doesn't appear to be a PEFT checkpoint. Starting fresh.")
+            model = get_peft_model(model, peft_config)
+    else:
+        # Fresh start: just apply LoRA config
+        model = get_peft_model(model, peft_config)
     
     # Verify LoRA targets were actually matched
     matched_count, total_targets, matched_modules = verify_lora_targets(model, target_modules)
@@ -599,7 +675,62 @@ def train(
     
     # Train
     logger.info("Starting LoRA training...")
-    trainer.train(resume_from_checkpoint=str(resume_from) if resume_from else None)
+    
+    # For PEFT checkpoints, adapter weights are already loaded above via _load_peft_with_key_remap.
+    # We need to restore optimizer/scheduler state manually since Trainer's resume_from_checkpoint
+    # expects full model checkpoints (with model.safetensors.index.json).
+    if resume_from is not None:
+        checkpoint_path = Path(resume_from)
+        trainer_state_path = checkpoint_path / "trainer_state.json"
+        
+        if trainer_state_path.exists():
+            import json
+            with open(trainer_state_path) as f:
+                saved_state = json.load(f)
+            
+            resume_step = saved_state.get("global_step", 0)
+            resume_epoch = saved_state.get("epoch", 0)
+            logger.info(f"Resuming from step {resume_step}, epoch {resume_epoch:.2f}")
+            
+            # Create optimizer/scheduler state restore callback
+            class RestoreOptimizerCallback(TrainerCallback):
+                def __init__(self, trainer_ref, checkpoint_path, resume_step, resume_epoch):
+                    self.trainer_ref = trainer_ref
+                    self.checkpoint_path = checkpoint_path
+                    self.resume_step = resume_step
+                    self.resume_epoch = resume_epoch
+                    self.restored = False
+                
+                def on_train_begin(self, args, state, control, **kwargs):
+                    if self.restored:
+                        return
+                    
+                    # Set the starting step/epoch
+                    state.global_step = self.resume_step
+                    state.epoch = self.resume_epoch
+                    
+                    # Load optimizer state (trainer.optimizer exists at this point)
+                    optimizer_path = self.checkpoint_path / "optimizer.pt"
+                    if optimizer_path.exists() and self.trainer_ref.optimizer is not None:
+                        logger.info("Loading optimizer state...")
+                        optimizer_state = torch.load(optimizer_path, map_location="cpu")
+                        self.trainer_ref.optimizer.load_state_dict(optimizer_state)
+                    
+                    # Load scheduler state
+                    scheduler_path = self.checkpoint_path / "scheduler.pt"
+                    if scheduler_path.exists() and self.trainer_ref.lr_scheduler is not None:
+                        logger.info("Loading scheduler state...")
+                        scheduler_state = torch.load(scheduler_path, map_location="cpu")
+                        self.trainer_ref.lr_scheduler.load_state_dict(scheduler_state)
+                    
+                    self.restored = True
+                    logger.info(f"Optimizer and scheduler state restored, resuming from step {self.resume_step}")
+            
+            trainer.add_callback(RestoreOptimizerCallback(trainer, checkpoint_path, resume_step, resume_epoch))
+        
+        trainer.train()
+    else:
+        trainer.train()
     
     # Log peak memory after training
     log_memory_usage("After training (peak)")
