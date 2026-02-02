@@ -220,6 +220,8 @@ phi2-contemplative-lora/
 # Data Directories
 prepared_data/
 filtered_guten/
+microsoft/
+sft_output/
 *.zip
 
 # Experiment Tracking
