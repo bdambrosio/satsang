@@ -59,9 +59,14 @@ from typing import Optional
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Optional import for local inference provider
+# Suppress httpx INFO logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Optional import for local inference providers
 try:
     import importlib.util
+    
+    # Try Phi2InferenceProvider
     inference_module_path = Path(__file__).parent / "phi2-contemplative-inference-lora.py"
     if inference_module_path.exists():
         spec = importlib.util.spec_from_file_location("phi2_inference", inference_module_path)
@@ -73,6 +78,17 @@ try:
 except Exception as e:
     Phi2InferenceProvider = None
     logger.debug(f"Phi2InferenceProvider not available: {e}")
+
+# Try ContemplativeRAGProvider
+try:
+    import contemplative_rag
+    ContemplativeRAGProvider = contemplative_rag.ContemplativeRAGProvider
+except ImportError as e:
+    ContemplativeRAGProvider = None
+    logger.debug(f"ContemplativeRAGProvider not available (ImportError): {e}")
+except Exception as e:
+    ContemplativeRAGProvider = None
+    logger.debug(f"ContemplativeRAGProvider not available: {e}")
 
 nan_yar=""""""
 
@@ -416,12 +432,11 @@ class LocalCritic(BaseCritic):
     
     def __init__(
         self,
-        base_url: str = "http://localhost:8000/v1",
-        model: str = "local-model",
+        base_url: str = "http://localhost:5000/v1",
+        model: Optional[str] = None,
         threshold: float = 6.0,
     ):
         self.base_url = base_url
-        self.model = model
         self.threshold = threshold
         
         try:
@@ -429,6 +444,33 @@ class LocalCritic(BaseCritic):
             self.http_client = httpx.Client(timeout=60.0)
         except ImportError:
             raise ImportError("pip install httpx")
+        
+        # Auto-detect model if not provided
+        if model is None:
+            self.model = self._detect_model()
+            logger.info(f"Auto-detected local critic model: {self.model}")
+        else:
+            self.model = model
+            logger.info(f"Using specified critic model: {self.model}")
+    
+    def _detect_model(self) -> str:
+        """Auto-detect model from local API."""
+        try:
+            resp = self.http_client.get(f"{self.base_url}/models")
+            resp.raise_for_status()
+            data = resp.json()
+            
+            # Handle OpenAI-compatible format
+            if "data" in data and len(data["data"]) > 0:
+                return data["data"][0]["id"]
+            elif isinstance(data, list) and len(data) > 0:
+                return data[0] if isinstance(data[0], str) else data[0].get("id", "local-model")
+            else:
+                logger.warning("Could not detect model, using 'local-model'")
+                return "local-model"
+        except Exception as e:
+            logger.warning(f"Could not detect local model: {e}, using 'local-model'")
+            return "local-model"
     
     def evaluate(self, user_input: str, response: str) -> CriticResult:
         """Evaluate using local model API."""
@@ -530,13 +572,23 @@ class ContemplativeGenerator:
         self.config = config or GenerationConfig()
         
         if inference_provider is not None:
-            if Phi2InferenceProvider is None:
+            # Check if it's a valid inference provider (Phi2InferenceProvider or ContemplativeRAGProvider)
+            is_valid = False
+            if Phi2InferenceProvider and isinstance(inference_provider, Phi2InferenceProvider):
+                is_valid = True
+            elif ContemplativeRAGProvider and isinstance(inference_provider, ContemplativeRAGProvider):
+                is_valid = True
+            
+            if not is_valid:
+                available = []
+                if Phi2InferenceProvider:
+                    available.append("Phi2InferenceProvider")
+                if ContemplativeRAGProvider:
+                    available.append("ContemplativeRAGProvider")
                 raise ValueError(
-                    "inference_provider provided but Phi2InferenceProvider not available. "
-                    "Ensure phi2-contemplative-inference-lora.py is in the same directory."
+                    f"inference_provider must be one of: {available}. "
+                    f"Got: {type(inference_provider).__name__}"
                 )
-            if not isinstance(inference_provider, Phi2InferenceProvider):
-                raise ValueError(f"inference_provider must be a Phi2InferenceProvider instance")
         
         if inference_provider is None:
             # Use HTTP API (backward compatible)
@@ -643,7 +695,7 @@ class ContemplativeGenerator:
                 result = self.critic.evaluate(user_input, candidate)
                 critic_results.append(result)
                 
-                logger.info(f"Attempt {attempt + 1}: response={candidate[:80]}")
+                logger.info(f"Attempt {attempt + 1}: response={candidate}")
                 logger.info(f"   score={result.score:.1f}")
                 if result.stale_signals:
                     logger.debug(f"  Stale signals: {result.stale_signals[:3]}")
@@ -707,7 +759,7 @@ class ContemplativeGenerator:
             try:
                 return self.inference_provider.generate_from_messages(
                     messages=messages,
-                    max_new_tokens=300,
+                    max_new_tokens=450,
                     temperature=temperature,
                     do_sample=True,
                 )
@@ -741,19 +793,29 @@ class ContemplativeGenerator:
 def example_usage(
     checkpoint_dir: Optional[str] = None,
     base_model: str = "microsoft/phi-2",
-    critic_provider: str = "anthropic",
-    critic_model: str = "claude-sonnet-4-20250514",
+    critic_provider: str = "local",
+    critic_model: Optional[str] = None,
+    critic_url: Optional[str] = None,
     test_prompts: Optional[list[str]] = None,
+    use_rag: bool = False,
+    rag_jsonl: Optional[str] = None,
+    rag_backend: str = "local",
+    rag_prompt_prefix: Optional[str] = None,
 ):
     """
-    Run the aliveness critic system with a local SFT model.
+    Run the aliveness critic system with a local SFT model or RAG provider.
     
     Args:
         checkpoint_dir: Path to SFT output checkpoint (e.g., "./sft_output/final")
         base_model: Base model name (only used if checkpoint doesn't specify it)
-        critic_provider: Critic provider ("anthropic" or "openai")
-        critic_model: Critic model name
+        critic_provider: Critic provider ("local", "anthropic", or "openai") - default: "local"
+        critic_model: Critic model name (auto-detected for local if None)
+        critic_url: Critic API URL for local provider (default: http://localhost:5000/v1)
         test_prompts: List of prompts to test (defaults to built-in examples)
+        use_rag: If True, use RAG provider instead of checkpoint
+        rag_jsonl: Path to JSONL file for RAG (default: ./ramana/Talks-parsed_reviewed.jsonl)
+        rag_backend: RAG backend ("local" or "openrouter")
+        rag_prompt_prefix: Optional custom prompt prefix for RAG
     """
     import argparse
     
@@ -770,19 +832,56 @@ def example_usage(
     print("=" * 60)
     
     # Setup critic
-    api_key = None
-    if critic_provider == "anthropic":
-        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
-    elif critic_provider == "openai":
-        api_key = os.environ.get("OPENAI_API_KEY")
+    if critic_provider == "local":
+        # Use local vLLM critic (auto-detects model from server)
+        critic_url = critic_url or "http://localhost:5000/v1"
+        logger.info(f"Using local critic at {critic_url} (will auto-detect model)")
+        critic = LocalCritic(base_url=critic_url, model=critic_model)  # Pass None to auto-detect
+    else:
+        # Use API-based critic (anthropic or openai)
+        api_key = None
+        if critic_provider == "anthropic":
+            api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
+        elif critic_provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY")
+        
+        if not api_key:
+            raise ValueError(f"API key not found. Set {critic_provider.upper()}_API_KEY environment variable.")
+        
+        if critic_model is None:
+            if critic_provider == "anthropic":
+                critic_model = "claude-sonnet-4-20250514"
+            elif critic_provider == "openai":
+                critic_model = "gpt-4"
+        
+        critic = LLMCritic(critic_provider, critic_model, api_key=api_key)
     
-    if not api_key:
-        raise ValueError(f"API key not found. Set {critic_provider.upper()}_API_KEY environment variable.")
-    
-    critic = LLMCritic(critic_provider, critic_model, api_key=api_key)
-    
-    # Setup generator with local inference provider
-    if checkpoint_dir:
+    # Setup generator with inference provider
+    if use_rag:
+        # Use RAG provider
+        if ContemplativeRAGProvider is None:
+            raise ValueError(
+                "ContemplativeRAGProvider not available. "
+                "Ensure contemplative_rag.py is in the same directory and install dependencies: "
+                "pip install sentence-transformers faiss-cpu numpy httpx"
+            )
+        
+        rag_jsonl_path = rag_jsonl or "./ramana/Talks-parsed_reviewed.jsonl"
+        logger.info(f"Using RAG provider with backend: {rag_backend}")
+        logger.info(f"Loading Q&A pairs from: {rag_jsonl_path}")
+        
+        provider = ContemplativeRAGProvider(
+            jsonl_path=rag_jsonl_path,
+            backend=rag_backend,
+            model=None,  # Will use hardcoded default for openrouter
+            custom_prompt_prefix=rag_prompt_prefix,
+        )
+        generator = ContemplativeGenerator(
+            inference_provider=provider,
+            critic=critic,
+        )
+    elif checkpoint_dir:
+        # Use SFT checkpoint provider
         if Phi2InferenceProvider is None:
             raise ValueError(
                 "Phi2InferenceProvider not available. "
@@ -804,7 +903,7 @@ def example_usage(
         )
     else:
         # Fallback to HTTP API
-        logger.warning("No checkpoint_dir provided, using HTTP API (http://localhost:5000/v1)")
+        logger.warning("No checkpoint_dir or RAG provided, using HTTP API (http://localhost:5000/v1)")
         generator = ContemplativeGenerator(
             generator_url="http://localhost:5000/v1",
             critic=critic,
@@ -848,6 +947,15 @@ Examples:
   
   # Use OpenAI critic instead of Anthropic
   python aliveness_critic.py --checkpoint ./sft_output/final --critic-provider openai --critic-model gpt-4
+  
+  # Use RAG provider with local vLLM backend
+  python aliveness_critic.py --use-rag --rag-backend local --prompts eval_prompts.txt
+  
+  # Use RAG provider with OpenRouter backend
+  python aliveness_critic.py --use-rag --rag-backend openrouter --prompts eval_prompts.txt
+  
+  # Use RAG with custom JSONL and prompt prefix
+  python aliveness_critic.py --use-rag --rag-backend openrouter --rag-jsonl ./custom.jsonl --rag-prompt-prefix "You are a contemplative teacher..."
         """
     )
     
@@ -867,21 +975,51 @@ Examples:
     parser.add_argument(
         "--critic-provider",
         type=str,
-        default="anthropic",
-        choices=["anthropic", "openai"],
-        help="Critic provider (default: anthropic)"
+        default="local",
+        choices=["local", "anthropic", "openai"],
+        help="Critic provider: 'local' (vLLM port 5000), 'anthropic', or 'openai' (default: local)"
     )
     parser.add_argument(
         "--critic-model",
         type=str,
-        default="claude-sonnet-4-20250514",
-        help="Critic model name (default: claude-sonnet-4-20250514)"
+        default=None,
+        help="Critic model name (default: auto-detect for local, claude-sonnet-4-20250514 for anthropic, gpt-4 for openai)"
+    )
+    parser.add_argument(
+        "--critic-url",
+        type=str,
+        default=None,
+        help="Critic API URL for local provider (default: http://localhost:5000/v1)"
     )
     parser.add_argument(
         "--prompts",
         type=str,
         default=None,
         help="Path to file with test prompts (one per line). If not provided, uses built-in examples."
+    )
+    parser.add_argument(
+        "--use-rag",
+        action="store_true",
+        help="Use RAG provider instead of checkpoint"
+    )
+    parser.add_argument(
+        "--rag-jsonl",
+        type=str,
+        default=None,
+        help="Path to JSONL file for RAG (default: ./ramana/Talks-parsed_reviewed.jsonl)"
+    )
+    parser.add_argument(
+        "--rag-backend",
+        type=str,
+        default="local",
+        choices=["local", "openrouter"],
+        help="RAG backend: 'local' (vLLM) or 'openrouter' (default: local)"
+    )
+    parser.add_argument(
+        "--rag-prompt-prefix",
+        type=str,
+        default=None,
+        help="Optional custom prompt prefix text for RAG (user-editable)"
     )
     
     args = parser.parse_args()
@@ -905,7 +1043,12 @@ Examples:
         base_model=args.base_model,
         critic_provider=args.critic_provider,
         critic_model=args.critic_model,
+        critic_url=args.critic_url,
         test_prompts=test_prompts,
+        use_rag=args.use_rag,
+        rag_jsonl=args.rag_jsonl,
+        rag_backend=args.rag_backend,
+        rag_prompt_prefix=args.rag_prompt_prefix,
     )
 
 
