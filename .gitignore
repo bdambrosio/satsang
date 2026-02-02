@@ -220,7 +220,6 @@ phi2-contemplative-lora/
 # Data Directories
 prepared_data/
 filtered_guten/
-ramana/
 *.zip
 
 # Experiment Tracking
