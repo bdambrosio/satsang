@@ -71,7 +71,7 @@ The model is post-trained on contemplative dialogues (primarily from Sri Ramana 
 Extract Q&A dialogues from source texts (e.g., "Talks with Sri Ramana Maharshi"):
 
 ```bash
-python parse-talks.py ramana/Talks-with-Sri-Ramana-Maharshi--complete.txt \
+python src/parse-talks.py ramana/Talks-with-Sri-Ramana-Maharshi--complete.txt \
     --output ramana/Talks-parsed.jsonl
 ```
 
@@ -90,7 +90,7 @@ This extracts structured conversations in JSONL format:
 Filter large text corpora for contemplative/spiritual content:
 
 ```bash
-python filter_spgc_corpus.py --input filtered_guten/ --output prepared_data/
+python src/filter_spgc_corpus.py --input filtered_guten/ --output prepared_data/
 ```
 
 ### 2. Continued Pretraining with LoRA
@@ -98,7 +98,7 @@ python filter_spgc_corpus.py --input filtered_guten/ --output prepared_data/
 Fine-tune Phi-2 on the contemplative corpus using Low-Rank Adaptation (LoRA):
 
 ```bash
-python continued-pretrain-lora.py train \
+python src/continued-pretrain-lora.py train \
     --data-dir ./prepared_data \
     --output-dir ./phi2-contemplative-lora \
     --wandb
@@ -126,7 +126,7 @@ The hypothesis: shifting from "helpful assistant" to "contemplative interlocutor
 Further fine-tune on structured Q&A dialogues:
 
 ```bash
-python sft_training.py \
+python src/sft_training.py \
     --model_path ./phi2-contemplative-lora/checkpoint-1000 \
     --data_path ramana/Talks-parsed.jsonl \
     --output_dir ./sft_output
@@ -140,7 +140,7 @@ This uses TRL's `SFTTrainer` for supervised fine-tuning on dialogue pairs.
 Load a checkpoint and generate responses:
 
 ```bash
-python phi2-contemplative-inference-lora.py \
+python src/phi2-contemplative-inference-lora.py \
     --checkpoint phi2-contemplative-lora/checkpoint-1000 \
     --query "I feel lost in my practice."
 ```
@@ -242,13 +242,16 @@ pip install openai anthropic httpx wandb
 
 ```
 satsang/
-├── continued-pretrain-lora.py      # LoRA pretraining
-├── sft_training.py                  # Supervised fine-tuning
-├── phi2-contemplative-inference-lora.py  # Inference
-├── aliveness_critic.py              # Response filtering
-├── parse-talks.py                   # Data extraction
-├── filter_spgc_corpus.py            # Corpus filtering
-├── diagnose-lora-checkpoint.py      # Checkpoint diagnostics
+├── src/
+│   ├── continued-pretrain-lora.py      # LoRA pretraining
+│   ├── sft_training.py                  # Supervised fine-tuning
+│   ├── phi2-contemplative-inference-lora.py  # Inference
+│   ├── aliveness_critic.py              # Response filtering
+│   ├── contemplative_rag.py              # RAG inference provider
+│   ├── parse-talks.py                   # Data extraction
+│   ├── filter_spgc_corpus.py            # Corpus filtering
+│   ├── diagnose-lora-checkpoint.py      # Checkpoint diagnostics
+│   └── ...                              # Other Python scripts
 ├── requirements.txt                 # Dependencies
 ├── prepared_data/                   # Training data (gitignored)
 ├── phi2-contemplative-lora/         # LoRA checkpoints (gitignored)

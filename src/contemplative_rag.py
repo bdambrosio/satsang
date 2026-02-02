@@ -62,25 +62,29 @@ class ContemplativeRAGProvider:
     
     def __init__(
         self,
-        jsonl_path: str = "./ramana/Talks-parsed_reviewed.jsonl",
+        jsonl_path: str = "./ramana/Talks-with-Sri-Ramana-Maharshi-parsed-reviewed-merged.jsonl",
+        face_to_face_path: Optional[str] = "./ramana/Face_to_Face_with_Sri_Ramana_Maharshi.txt",
         backend: str = "local",  # "local" or "openrouter"
         model: Optional[str] = None,
         local_url: str = "http://localhost:5000/v1",
         top_k: int = 3,
         embedding_model: str = "all-MiniLM-L6-v2",
         custom_prompt_prefix: Optional[str] = None,
+        max_paragraph_chars: int = 2000,
     ):
         """
         Initialize RAG provider.
         
         Args:
             jsonl_path: Path to Talks-parsed_reviewed.jsonl
+            face_to_face_path: Path to Face_to_Face_with_Sri_Ramana_Maharshi.txt (optional)
             backend: "local" (vLLM) or "openrouter"
             model: Model name (optional - defaults to "anthropic/claude-sonnet-4" for openrouter)
             local_url: Local vLLM API URL
             top_k: Number of Q&A pairs to retrieve
             embedding_model: Sentence transformer model for embeddings
             custom_prompt_prefix: Optional text to insert before query (user will edit)
+            max_paragraph_chars: Maximum characters per paragraph in Face_to_Face index (default: 2000)
         """
         self.backend = backend
         # Hardcode default model for openrouter
@@ -91,6 +95,7 @@ class ContemplativeRAGProvider:
         self.local_url = local_url
         self.top_k = top_k
         self.custom_prompt_prefix = custom_prompt_prefix or ""
+        self.max_paragraph_chars = max_paragraph_chars
         
         # Setup HTTP client
         self.http_client = httpx.Client(timeout=120.0)
@@ -104,10 +109,22 @@ class ContemplativeRAGProvider:
         self.qa_pairs = self._load_qa_pairs(jsonl_path)
         logger.info(f"Loaded {len(self.qa_pairs)} Q&A pairs")
         
-        # Build FAISS index
-        logger.info("Building FAISS index...")
+        # Build FAISS index for Q&A pairs
+        logger.info("Building FAISS index for Q&A pairs...")
         self.index, self.questions = self._build_index()
         logger.info(f"FAISS index built: {self.index.ntotal} vectors")
+        
+        # Load and index Face_to_Face passages if provided
+        self.face_to_face_passages = []
+        self.face_to_face_index = None
+        if face_to_face_path:
+            logger.info(f"Loading Face_to_Face passages from {face_to_face_path}")
+            self.face_to_face_passages = self._load_face_to_face_passages(face_to_face_path)
+            logger.info(f"Loaded {len(self.face_to_face_passages)} passages")
+            if self.face_to_face_passages:
+                logger.info("Building FAISS index for Face_to_Face passages...")
+                self.face_to_face_index = self._build_face_to_face_index()
+                logger.info(f"Face_to_Face FAISS index built: {self.face_to_face_index.ntotal} vectors")
         
         # Auto-detect model if using local backend
         if backend == "local" and model is None:
@@ -116,7 +133,8 @@ class ContemplativeRAGProvider:
 
         if not custom_prompt_prefix:
             self.custom_prompt_prefix = """You are a contemplative teacher. You are 'answering' questions about the teachings of Ramana Maharshi.
-Your goal is to transmit the teachings of Ramana Maharshi in a way that is helpful and insightful for the user. This will often mean responding to the question in a way that is intended to direct the user back to the self, and to the next step in their practice. Do not to give advice or tell the user what to do. Do not to be pedantic or overly technical.
+Your goal is to transmit the teachings of Ramana Maharshi in a way that is helpful and insightful for the user. This will often mean responding to the question in a way that is intended to direct the user back to the self, rather that the usual expositional style of classroom teaching. Do not to give advice or tell the user what to do. Do not to be pedantic or overly technical. You may choose to respond with a relevant quote from Nam Yar or an anecdote from Face_to_Face with Sri Ramana Maharshi.
+
 Focus always on Ramana Maharshi's teachings as given in Nam Yar:
 
 Since all sentient beings like [love or want] to be always happy without what is called misery, since for everyone the greatest love is only for oneself, and since happiness alone is the cause for love, [in order] to obtain that happiness, which is one’s svabhāva [own being, existence or nature], which one experiences daily in [dreamless] sleep, which is devoid of mind, oneself knowing oneself is necessary. For that, jñāna-vicāra [awareness-investigation] called ‘who am I’ alone is the principal means.
@@ -217,7 +235,7 @@ If oneself rises [or appears] [as ego or mind], everything rises [or appears]; i
         
         # Generate embeddings
         logger.info("Generating embeddings...")
-        embeddings = self.embedder.encode(questions, show_progress_bar=True)
+        embeddings = self.embedder.encode(questions, show_progress_bar=False)
         embeddings = np.array(embeddings).astype('float32')
         
         # Build FAISS index (L2 distance)
@@ -230,7 +248,7 @@ If oneself rises [or appears] [as ego or mind], everything rises [or appears]; i
     def _retrieve_similar(self, query: str) -> list[dict]:
         """Retrieve top-k similar Q&A pairs."""
         # Embed query
-        query_embedding = self.embedder.encode([query])
+        query_embedding = self.embedder.encode([query], show_progress_bar=False)
         query_embedding = np.array(query_embedding).astype('float32')
         
         # Search
@@ -245,6 +263,121 @@ If oneself rises [or appears] [as ego or mind], everything rises [or appears]; i
                     **self.qa_pairs[idx],
                     "distance": float(dist),
                 })
+        
+        return results
+    
+    def _load_face_to_face_passages(self, txt_path: str) -> list[str]:
+        """Load passages from Face_to_Face text file, filtering by rules."""
+        passages = []
+        path = Path(txt_path)
+        
+        if not path.exists():
+            logger.warning(f"Face_to_Face text file not found: {txt_path}")
+            return passages
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            current_paragraph = []
+            
+            for line in f:
+                line = line.rstrip('\n\r')
+                
+                # Skip blank lines (they mark paragraph breaks)
+                if not line.strip():
+                    if current_paragraph:
+                        paragraph_text = ' '.join(current_paragraph).strip()
+                        if self._is_valid_passage(paragraph_text):
+                            passages.append(paragraph_text)
+                        current_paragraph = []
+                    continue
+                
+                # Filter lines
+                if self._should_skip_line(line):
+                    continue
+                
+                current_paragraph.append(line)
+            
+            # Handle last paragraph
+            if current_paragraph:
+                paragraph_text = ' '.join(current_paragraph).strip()
+                if self._is_valid_passage(paragraph_text):
+                    passages.append(paragraph_text)
+        
+        return passages
+    
+    def _should_skip_line(self, line: str) -> bool:
+        """Check if a line should be skipped."""
+        line_stripped = line.strip()
+        
+        # Skip if less than 64 chars
+        if len(line_stripped) < 64:
+            return True
+        
+        # Skip if all caps (likely headers)
+        if line_stripped.isupper() and len(line_stripped) > 10:
+            return True
+        
+        # Skip if starts with a number (likely page numbers or references)
+        if line_stripped and line_stripped[0].isdigit():
+            return True
+        
+        return False
+    
+    def _is_valid_passage(self, passage: str) -> bool:
+        """Check if a passage is valid (not too long, not empty)."""
+        if not passage or len(passage.strip()) < 64:
+            return False
+        
+        # Skip if too long
+        if len(passage) > self.max_paragraph_chars:
+            return False
+        
+        return True
+    
+    def _build_face_to_face_index(self):
+        """Build FAISS index from Face_to_Face passages."""
+        if not self.face_to_face_passages:
+            return None
+        
+        # Generate embeddings
+        logger.info("Generating embeddings for Face_to_Face passages...")
+        embeddings = self.embedder.encode(self.face_to_face_passages, show_progress_bar=False)
+        embeddings = np.array(embeddings).astype('float32')
+        
+        # Build FAISS index (L2 distance)
+        dimension = embeddings.shape[1]
+        index = faiss.IndexFlatL2(dimension)
+        index.add(embeddings)
+        
+        return index
+    
+    def query_passages(self, query: str, top_n: int = 3) -> list[str]:
+        """
+        Query Face_to_Face passages and return top N passages.
+        
+        Args:
+            query: Query string
+            top_n: Number of passages to return
+        
+        Returns:
+            List of passage strings (sorted by relevance)
+        """
+        if self.face_to_face_index is None or not self.face_to_face_passages:
+            logger.warning("Face_to_Face index not available")
+            return []
+        
+        # Embed query
+        query_embedding = self.embedder.encode([query], show_progress_bar=False)
+        query_embedding = np.array(query_embedding).astype('float32')
+        
+        # Search
+        k = min(top_n, len(self.face_to_face_passages))
+        distances, indices = self.face_to_face_index.search(query_embedding, k)
+        
+        # Return passages (sorted by distance, ascending)
+        results = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if idx < len(self.face_to_face_passages):
+                results.append(self.face_to_face_passages[idx])
         
         return results
     
@@ -289,7 +422,16 @@ If oneself rises [or appears] [as ego or mind], everything rises [or appears]; i
         
         context_text = "\n".join(context_parts)
         
-        # Build full prompt
+        # Query Face_to_Face passages
+        face_to_face_passages = self.query_passages(query, top_n=5)
+        face_to_face_parts = []
+        for passage in face_to_face_passages:
+            face_to_face_parts.append(f"{passage}")
+            face_to_face_parts.append("")
+        
+        face_to_face_text = "\n".join(face_to_face_parts)
+ 
+         # Build full prompt
         prompt_parts = []
         
         # Custom prefix (user can edit this via custom_prompt_prefix parameter)
@@ -297,6 +439,12 @@ If oneself rises [or appears] [as ego or mind], everything rises [or appears]; i
             prompt_parts.append(self.custom_prompt_prefix)
             prompt_parts.append("")
         
+        # Retrieved Face_to_Face passages
+        if face_to_face_text:
+            prompt_parts.append("Possibly relevant passages from Face_to_Face with Bhagavan:")
+            prompt_parts.append(face_to_face_text)
+            prompt_parts.append("")
+
         # Retrieved context
         if context_text:
             prompt_parts.append("Possibly relevant texts from Q/A sessions with Bhagavan:")
@@ -326,7 +474,7 @@ Bhagavan:
         self,
         query: str,
         max_new_tokens: int = 200,
-        temperature: float = 0.5,
+        temperature: float = 0.7,
         top_p: float = 0.9,
         do_sample: bool = True,
     ) -> str:

@@ -620,8 +620,8 @@ class ContemplativeGenerator:
             logger.info("Using local inference provider")
         
         # Load nan-yar.txt
-        script_dir = Path(__file__).parent
-        nan_yar_path = script_dir / "nan-yar.txt"
+        script_dir = Path(__file__).parent.parent
+        nan_yar_path = script_dir / "ramana/nan-yar.txt"
         if nan_yar_path.exists():
             with open(nan_yar_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -695,8 +695,8 @@ class ContemplativeGenerator:
                 result = self.critic.evaluate(user_input, candidate)
                 critic_results.append(result)
                 
-                logger.info(f"Attempt {attempt + 1}: response={candidate}")
-                logger.info(f"   score={result.score:.1f}")
+                logger.debug(f"Attempt {attempt + 1}: response={candidate}")
+                logger.debug(f"   score={result.score:.1f}")
                 if result.stale_signals:
                     logger.debug(f"  Stale signals: {result.stale_signals[:3]}")
                 
@@ -813,7 +813,7 @@ def example_usage(
         critic_url: Critic API URL for local provider (default: http://localhost:5000/v1)
         test_prompts: List of prompts to test (defaults to built-in examples)
         use_rag: If True, use RAG provider instead of checkpoint
-        rag_jsonl: Path to JSONL file for RAG (default: ./ramana/Talks-parsed_reviewed.jsonl)
+        rag_jsonl: Path to JSONL file for RAG (default: ./ramana/Talks-with-Sri-Ramana-Maharshi-parsed-reviewed-merged.jsonl)
         rag_backend: RAG backend ("local" or "openrouter")
         rag_prompt_prefix: Optional custom prompt prefix for RAG
     """
@@ -826,10 +826,6 @@ def example_usage(
             "What should I do with my life?",
             "I'm afraid of death.",
         ]
-    
-    print("=" * 60)
-    print("ALIVENESS CRITIC EVALUATION")
-    print("=" * 60)
     
     # Setup critic
     if critic_provider == "local":
@@ -866,7 +862,7 @@ def example_usage(
                 "pip install sentence-transformers faiss-cpu numpy httpx"
             )
         
-        rag_jsonl_path = rag_jsonl or "./ramana/Talks-parsed_reviewed.jsonl"
+        rag_jsonl_path = rag_jsonl or "./ramana/Talks-with-Sri-Ramana-Maharshi-parsed-reviewed-merged.jsonl"
         logger.info(f"Using RAG provider with backend: {rag_backend}")
         logger.info(f"Loading Q&A pairs from: {rag_jsonl_path}")
         
@@ -1005,8 +1001,8 @@ Examples:
     parser.add_argument(
         "--rag-jsonl",
         type=str,
-        default=None,
-        help="Path to JSONL file for RAG (default: ./ramana/Talks-parsed_reviewed.jsonl)"
+            default=None,
+            help="Path to JSONL file for RAG (default: ./ramana/Talks-parsed_reviewed.jsonl)"
     )
     parser.add_argument(
         "--rag-backend",
