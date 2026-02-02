@@ -643,8 +643,8 @@ def main():
     critic = None
     if args.use_critic:
         try:
-            from aliveness_critic import LLMCritic
-            critic = LLMCritic(provider="anthropic", model="claude-sonnet-4-20250514")
+            from aliveness_critic import LocalCritic
+            critic = LocalCritic(backend="openrouter", model="anthropic/claude-sonnet-4")
             logger.info("Initialized AlivenessCritic")
         except Exception as e:
             logger.warning(f"Could not initialize critic: {e}")

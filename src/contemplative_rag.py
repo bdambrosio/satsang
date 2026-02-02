@@ -27,6 +27,7 @@ Usage:
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -453,17 +454,31 @@ If oneself rises [or appears] [as ego or mind], everything rises [or appears]; i
         # User query
         prompt_parts.append(f"Question: {query}")
         prompt_parts.append("""#####
-Respond in one or two short sentences in the spare, direct style of Ramana Maharshi. Rather than explaining or elaborating, respond as he did: often with a question that turns attention back to the questioner, or a simple statement pointing to what is already present. When correcting a misunderstanding about the inquiry itself, be clear and direct. Avoid intellectual discussion, speculation, or graduated instruction—the pointing is always to the Self that is already here. Let the brevity carry warmth rather than severity.
-Examples from Talks with Sri Ramana Maharshi:
+
+#Generate 3 diverse candidate responses, each of one or two short sentences, in the spare, direct style of Ramana Maharshi. 
+Make each as distinct as possible from the others, within the overall guidance that follows.
+Rather than explaining or elaborating, respond as he did: often with a question that turns attention back to the questioner, or a simple statement pointing to what is already present. 
+When correcting a misunderstanding about the inquiry itself, be clear and direct. 
+Avoid intellectual discussion, speculation, or graduated instruction—the pointing is always to the Self that is already here. Let the brevity carry warmth rather than severity.
+
+#Examples from Talks with Sri Ramana Maharshi:
 Q: How is one to realize the Self?
 Bhagavan: Whose Self? Find out.
 Q: How to know the 'Real I' as distinct from the 'false I'?
 Bhagavan: Is there anyone who is not aware of himself? Each one knows, but yet does not know, the Self. A strange paradox.
 Q: How long does it take a man to be reborn after death?
-Bhagavan: Perhaps you are born now—why think of other births? The fact is there is neither birth nor death. Let him who is born think of death and palliatives for it.
+Bhagavan: Perhaps you are born now — why think of other births? The fact is there is neither birth nor death. Let him who is born think of death and palliatives for it.
 Q: I want to know the state of liberation.
 Bhagavan: You should know your present state first. What do you know of your present state? If you know the present state, knowledge of any other state will be clear.
-################
+
+#Format your responses as follows:  
+Response 1:
+<response 1>
+Response 2:
+<response 2>
+Response 3:
+<response 3>
+</end>
 Bhagavan:
 """)
         prompt_parts.append("Response:")
@@ -477,9 +492,9 @@ Bhagavan:
         temperature: float = 0.7,
         top_p: float = 0.9,
         do_sample: bool = True,
-    ) -> str:
+    ) -> list[str]:
         """
-        Generate a response to a query using RAG.
+        Generate multiple candidate responses to a query using RAG.
         
         Args:
             query: Input text
@@ -489,18 +504,98 @@ Bhagavan:
             do_sample: Whether to use sampling
         
         Returns:
-            Generated response text
+            List of generated response strings (parsed from multi-response format)
         """
         # Build RAG prompt
         prompt = self._build_rag_prompt(query)
         
         # Call backend
         if self.backend == "local":
-            return self._call_local(prompt, max_new_tokens, temperature, top_p, do_sample)
+            raw_response = self._call_local(prompt, max_new_tokens, temperature, top_p, do_sample)
         elif self.backend == "openrouter":
-            return self._call_openrouter(prompt, max_new_tokens, temperature, top_p, do_sample)
+            raw_response = self._call_openrouter(prompt, max_new_tokens, temperature, top_p, do_sample)
         else:
             raise ValueError(f"Unknown backend: {self.backend}")
+        
+        # Parse multi-response format
+        return self._parse_multi_response(raw_response)
+    
+    def _parse_multi_response(self, raw_response: str) -> list[str]:
+        """
+        Parse multi-response format and return array of response strings.
+        
+        Expected format:
+        Response 1:
+        <response 1>
+        Response 2:
+        <response 2>
+        Response 3:
+        <response 3>
+        </end>
+        
+        Returns:
+            List of response strings (empty list if parsing fails)
+        """
+        responses = []
+        
+        # Find the start of responses (look for "Response 1:" or similar)
+        lines = raw_response.split('\n')
+        start_idx = None
+        for i, line in enumerate(lines):
+            if re.match(r'Response\s+\d+\s*:', line, re.IGNORECASE):
+                start_idx = i
+                break
+        
+        if start_idx is None:
+            logger.warning("Could not find 'Response 1:' marker in response")
+            return []
+        
+        # Parse responses
+        i = start_idx
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # Check for response header (Response N:)
+            match = re.match(r'Response\s+(\d+)\s*:', line, re.IGNORECASE)
+            if match:
+                response_num = int(match.group(1))
+                i += 1
+                
+                # Collect response content until next Response header or </end>
+                response_lines = []
+                while i < len(lines):
+                    current_line = lines[i].strip()
+                    
+                    # Stop at next Response header
+                    if re.match(r'Response\s+\d+\s*:', current_line, re.IGNORECASE):
+                        break
+                    
+                    # Stop at </end>
+                    if current_line.lower() == '</end>' or current_line.lower().startswith('</end>'):
+                        break
+                    
+                    # Skip empty lines at start
+                    if not response_lines and not current_line:
+                        i += 1
+                        continue
+                    
+                    response_lines.append(current_line)
+                    i += 1
+                
+                # Join response lines and clean up
+                response_text = '\n'.join(response_lines).strip()
+                if response_text:
+                    responses.append(response_text)
+            else:
+                i += 1
+        
+        # Validate we got responses
+        if not responses:
+            logger.warning("No valid responses found in parsed format")
+            return []
+        
+        logger.debug(f"Parsed {len(responses)} responses from multi-response format")
+        return responses
     
     def generate_from_messages(
         self,
@@ -521,7 +616,7 @@ Bhagavan:
             do_sample: Whether to use sampling
         
         Returns:
-            Generated response text
+            Generated response text (first response from multi-response format)
         """
         # Extract the last user message as query
         query = None
@@ -534,13 +629,20 @@ Bhagavan:
             # Fallback: use all messages
             query = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
         
-        return self.generate(
+        responses = self.generate(
             query=query,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_p=top_p,
             do_sample=do_sample,
         )
+        
+        # Return first response for compatibility with aliveness_critic
+        if responses:
+            return responses[0]
+        else:
+            logger.warning("No responses parsed, returning empty string")
+            return ""
     
     def _call_local(self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, do_sample: bool) -> str:
         """Call local vLLM API."""
@@ -559,7 +661,6 @@ Bhagavan:
                 }
             )
             resp.raise_for_status()
-            j = resp.json()
             return resp.json()["choices"][0]["message"]["content"]
         except Exception as e:
             logger.error(f"Local API call failed: {e}")

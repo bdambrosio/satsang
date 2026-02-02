@@ -19,9 +19,9 @@ Architecture:
 
 Usage:
     # Using HTTP API (default)
-    from aliveness_critic import AlivenessCritic, ContemplativeGenerator
+    from aliveness_critic import LocalCritic, ContemplativeGenerator
     
-    critic = AlivenessCritic(model="openai/gpt-4", threshold=6.0)
+    critic = LocalCritic(backend="openrouter", model="anthropic/claude-sonnet-4")
     generator = ContemplativeGenerator(
         generator_url="http://localhost:5000/v1",
         critic=critic,
@@ -42,7 +42,7 @@ Usage:
     response = generator.generate("I feel lost in my practice.")
 
 Requirements:
-    pip install openai anthropic httpx torch transformers peft
+    pip install httpx torch transformers peft
 """
 
 import argparse
@@ -55,6 +55,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -122,22 +127,23 @@ STALE responses:
 You are detecting the CLOSURE REFLEX—the habitual move toward resolution,
 helpfulness, and answer-giving that kills contemplative space.
 
-Respond with a JSON object:
-{
-    "score": <float 0-10>,
-    "alive_signals": [<list of specific alive qualities observed>],
-    "stale_signals": [<list of specific stale qualities observed>],
-    "reasoning": "<brief explanation>",
-    "suggestion": "<optional: how it might be improved, or 'none'>"
-}
+First identify the specific qualities (ALIVE or STALE) that are present in the response.
+Then score the response based on the specific qualities present, using this scale:
 
-Score guide:
 - 9-10: Genuinely alive, creates space, masterful
 - 7-8: Good, mostly alive with minor staleness
 - 5-6: Mixed, some alive qualities but closure reflex present
 - 3-4: Mostly stale, performing rather than being
 - 1-2: Generic spiritual chatbot output
 - 0: Actively harmful to contemplative space
+
+Respond with a JSON object:
+{
+    "score": <float 0-10>,
+    "reasoning": "<terse (8-10 word) explanation>",
+    "suggestion": "<optional: terse (6-12 word) statement of how it might be improved, or 'none'>"
+}
+
 """
 
 ALIVENESS_CRITIC_USER = """Evaluate this response for aliveness.
@@ -232,9 +238,6 @@ class CriticResult:
     def display(self) -> str:
         """Pretty-print the critic result."""
         lines = []
-        lines.append("=" * 60)
-        lines.append("ALIVENESS CRITIC RESULT")
-        lines.append("=" * 60)
         
         # Score and status
         status = "✓ ALIVE" if self.is_alive else "✗ STALE"
@@ -306,136 +309,21 @@ class BaseCritic(ABC):
         return is_stale, matched
 
 
-class LLMCritic(BaseCritic):
-    """
-    Uses a large LLM (GPT-4, Claude, etc.) as the critic.
-    
-    The insight: recognition is easier than generation.
-    A large model can identify staleness even if it can't avoid generating it.
-    """
-    
-    def __init__(
-        self,
-        provider: str = "anthropic",  # or "openai"
-        model: str = "claude-sonnet-4-20250514",
-        api_key: Optional[str] = None,
-        threshold: float = 6.0,
-    ):
-        self.provider = provider
-        self.model = model
-        self.threshold = threshold
-        
-        # Resolve API key from parameter or environment
-        if provider == "anthropic":
-            if api_key is None:
-                # Try CLAUDE_API_KEY first (user's convention), then ANTHROPIC_API_KEY (standard)
-                api_key = os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
-            self.api_key = api_key
-            try:
-                import anthropic
-                self.client = anthropic.Anthropic(api_key=api_key)
-            except ImportError:
-                raise ImportError("pip install anthropic")
-        elif provider == "openai":
-            if api_key is None:
-                api_key = os.environ.get("OPENAI_API_KEY")
-            self.api_key = api_key
-            try:
-                import openai
-                self.client = openai.OpenAI(api_key=api_key)
-            except ImportError:
-                raise ImportError("pip install openai")
-        else:
-            raise ValueError(f"Unknown provider: {provider}")
-    
-    def evaluate(self, user_input: str, response: str) -> CriticResult:
-        """Evaluate response using LLM critic."""
-        
-        # Quick check first
-        is_obviously_stale, stale_markers = self.quick_stale_check(response)
-        if is_obviously_stale:
-            return CriticResult(
-                score=2.0,
-                stale_signals=stale_markers[:5],
-                reasoning="Failed quick staleness check (multiple stale patterns detected)",
-            )
-        
-        # Full LLM evaluation
-        prompt = ALIVENESS_CRITIC_USER.format(
-            user_input=user_input,
-            response=response
-        )
-        
-        try:
-            if self.provider == "anthropic":
-                raw = self._call_anthropic(prompt)
-            else:
-                raw = self._call_openai(prompt)
-            
-            return self._parse_result(raw)
-            
-        except Exception as e:
-            logger.warning(f"Critic evaluation failed: {e}")
-            # On failure, assume it's borderline
-            return CriticResult(score=5.0, reasoning=f"Evaluation error: {e}")
-    
-    def _call_anthropic(self, prompt: str) -> str:
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=500,
-            system=ALIVENESS_CRITIC_SYSTEM,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.content[0].text
-    
-    def _call_openai(self, prompt: str) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            max_tokens=500,
-            messages=[
-                {"role": "system", "content": ALIVENESS_CRITIC_SYSTEM},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return response.choices[0].message.content
-    
-    def _parse_result(self, raw: str) -> CriticResult:
-        """Parse JSON response from critic."""
-        try:
-            # Extract JSON from response (handle markdown code blocks)
-            json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-            else:
-                data = json.loads(raw)
-            
-            return CriticResult(
-                score=float(data.get('score', 5.0)),
-                alive_signals=data.get('alive_signals', []),
-                stale_signals=data.get('stale_signals', []),
-                reasoning=data.get('reasoning', ''),
-                suggestion=data.get('suggestion', ''),
-                raw_response=raw,
-            )
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.warning(f"Failed to parse critic response: {e}\nRaw: {raw}")
-            return CriticResult(score=5.0, reasoning=f"Parse error: {e}", raw_response=raw)
-
-
 class LocalCritic(BaseCritic):
     """
-    Uses a local model (via vLLM, SGLang, llama.cpp, etc.) as critic.
+    Uses a local model (via vLLM) or OpenRouter as critic.
     
-    For when you want to avoid API costs or need offline operation.
-    Requires a capable local model (70B+ recommended for good discrimination).
+    Supports both local vLLM (port 5000) and OpenRouter API.
     """
     
     def __init__(
         self,
+        backend: str = "local",  # "local" or "openrouter"
         base_url: str = "http://localhost:5000/v1",
         model: Optional[str] = None,
         threshold: float = 6.0,
     ):
+        self.backend = backend
         self.base_url = base_url
         self.threshold = threshold
         
@@ -445,13 +333,20 @@ class LocalCritic(BaseCritic):
         except ImportError:
             raise ImportError("pip install httpx")
         
-        # Auto-detect model if not provided
-        if model is None:
-            self.model = self._detect_model()
-            logger.info(f"Auto-detected local critic model: {self.model}")
-        else:
-            self.model = model
-            logger.info(f"Using specified critic model: {self.model}")
+        # Set model
+        if backend == "openrouter":
+            if model is None:
+                self.model = "anthropic/claude-sonnet-4"  # Default for openrouter
+            else:
+                self.model = model
+            logger.info(f"Using OpenRouter critic model: {self.model}")
+        else:  # local
+            if model is None:
+                self.model = self._detect_model()
+                logger.info(f"Auto-detected local critic model: {self.model}")
+            else:
+                self.model = model
+                logger.info(f"Using specified critic model: {self.model}")
     
     def _detect_model(self) -> str:
         """Auto-detect model from local API."""
@@ -490,28 +385,61 @@ class LocalCritic(BaseCritic):
         )
         
         try:
-            resp = self.http_client.post(
-                f"{self.base_url}/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": ALIVENESS_CRITIC_SYSTEM},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "max_tokens": 500,
-                    "temperature": 0.3,
-                }
-            )
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"]
-            return self._parse_result(raw)
-            
+            if self.backend == "openrouter":
+                return self._call_openrouter(prompt)
+            else:
+                return self._call_local(prompt)
         except Exception as e:
-            logger.warning(f"Local critic failed: {e}")
+            logger.warning(f"Critic evaluation failed: {e}")
             return CriticResult(score=5.0, reasoning=f"Error: {e}")
     
+    def _call_local(self, prompt: str) -> CriticResult:
+        """Call local vLLM API."""
+        resp = self.http_client.post(
+            f"{self.base_url}/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": ALIVENESS_CRITIC_SYSTEM},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 500,
+                "temperature": 0.3,
+            }
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"]
+        return self._parse_result(raw)
+    
+    def _call_openrouter(self, prompt: str) -> CriticResult:
+        """Call OpenRouter API."""
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY environment variable required")
+        
+        resp = self.http_client.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "https://github.com/your-repo",
+                "X-Title": "Contemplative Critic",
+            },
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": ALIVENESS_CRITIC_SYSTEM},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 500,
+                "temperature": 0.3,
+            }
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"]
+        return self._parse_result(raw)
+    
     def _parse_result(self, raw: str) -> CriticResult:
-        """Same parsing as LLMCritic."""
+        """Parse JSON response from critic."""
         try:
             json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
             if json_match:
@@ -676,6 +604,137 @@ class ContemplativeGenerator:
                 conversation_history = [{"role": "system", "content": random.choice(self.nan_yar)}]
             else:
                 conversation_history = []
+        
+        # Check if using ContemplativeRAGProvider (returns multiple responses)
+        is_rag_provider = (
+            ContemplativeRAGProvider is not None
+            and self.inference_provider is not None
+            and isinstance(self.inference_provider, ContemplativeRAGProvider)
+        )
+        
+        if is_rag_provider:
+            # RAG provider returns multiple responses in one call
+            return self._generate_with_rag_provider(user_input, conversation_history)
+        else:
+            # Standard provider: make multiple attempts
+            return self._generate_with_standard_provider(user_input, conversation_history)
+    
+    def _generate_with_rag_provider(self, user_input: str, conversation_history: list[dict]) -> dict:
+        """Generate using RAG provider that returns multiple responses."""
+        critic_results = []
+        
+        # Generate all candidates in one call
+        temperature = self.config.temperature_base
+        messages = conversation_history + [{"role": "user", "content": user_input}]
+        
+        try:
+            candidates = self.inference_provider.generate(
+                query=user_input,
+                max_new_tokens=450,
+                temperature=temperature,
+                do_sample=True,
+            )
+        except Exception as e:
+            logger.warning(f"RAG generation failed: {e}")
+            return {
+                "response": "[silence]",
+                "is_silence": True,
+                "attempts": 0,
+                "final_score": 0.0,
+                "critic_results": [],
+            }
+        
+        if not candidates:
+            logger.warning("No candidates returned from RAG provider")
+            return {
+                "response": "[silence]",
+                "is_silence": True,
+                "attempts": 0,
+                "final_score": 0.0,
+                "critic_results": [],
+            }
+        
+        # Evaluate all candidates
+        scored_candidates = []
+        for candidate in candidates:
+            if not candidate:
+                continue
+            
+            if self.critic:
+                result = self.critic.evaluate(user_input, candidate)
+                critic_results.append(result)
+                
+                logger.debug(f"Response: {candidate[:80]}")
+                logger.debug(f"   score={result.score:.1f}")
+                
+                scored_candidates.append({"response": candidate, "score": result.score, "result": result})
+            else:
+                # No critic, use all candidates equally
+                scored_candidates.append({"response": candidate, "score": 5.0, "result": None})
+        
+        if not scored_candidates:
+            return {
+                "response": "[silence]",
+                "is_silence": True,
+                "attempts": len(candidates),
+                "final_score": 0.0,
+                "critic_results": critic_results,
+            }
+        
+        # Filter by threshold
+        acceptable = [c for c in scored_candidates if c["score"] >= self.config.threshold]
+        
+        if acceptable:
+            # Select using probabilities weighted by score (normalized)
+            if np is None:
+                raise ImportError("numpy is required for score-weighted selection")
+            
+            scores = np.array([c["score"] for c in acceptable])
+            # Normalize scores to probabilities (softmax-like, but simpler: just normalize)
+            # Shift scores to be positive (add min to ensure all positive)
+            min_score = scores.min()
+            if min_score < 0:
+                scores = scores - min_score + 1.0
+            probabilities = scores / scores.sum()
+            
+            # Sample one response
+            selected_idx = np.random.choice(len(acceptable), p=probabilities)
+            selected = acceptable[selected_idx]
+            
+            logger.debug(f"Selected response (score={selected['score']:.1f}) from {len(acceptable)} acceptable candidates")
+            
+            return {
+                "response": selected["response"],
+                "is_silence": False,
+                "attempts": len(candidates),
+                "final_score": selected["score"],
+                "critic_results": critic_results,
+            }
+        else:
+            # No acceptable responses
+            if self.config.allow_silence:
+                best_score = max(c["score"] for c in scored_candidates)
+                if best_score < self.config.silence_threshold:
+                    return {
+                        "response": "[silence]",
+                        "is_silence": True,
+                        "attempts": len(candidates),
+                        "final_score": best_score,
+                        "critic_results": critic_results,
+                    }
+            
+            # Return best even if below threshold
+            best = max(scored_candidates, key=lambda c: c["score"])
+            return {
+                "response": best["response"],
+                "is_silence": False,
+                "attempts": len(candidates),
+                "final_score": best["score"],
+                "critic_results": critic_results,
+            }
+    
+    def _generate_with_standard_provider(self, user_input: str, conversation_history: list[dict]) -> dict:
+        """Generate using standard provider (multiple attempts)."""
         critic_results = []
         best_response = None
         best_score = 0.0
@@ -808,7 +867,7 @@ def example_usage(
     Args:
         checkpoint_dir: Path to SFT output checkpoint (e.g., "./sft_output/final")
         base_model: Base model name (only used if checkpoint doesn't specify it)
-        critic_provider: Critic provider ("local", "anthropic", or "openai") - default: "local"
+        critic_provider: Critic provider ("local" or "openrouter") - default: "local"
         critic_model: Critic model name (auto-detected for local if None)
         critic_url: Critic API URL for local provider (default: http://localhost:5000/v1)
         test_prompts: List of prompts to test (defaults to built-in examples)
@@ -827,30 +886,18 @@ def example_usage(
             "I'm afraid of death.",
         ]
     
-    # Setup critic
+    # Setup critic (local or openrouter only)
     if critic_provider == "local":
         # Use local vLLM critic (auto-detects model from server)
         critic_url = critic_url or "http://localhost:5000/v1"
         logger.info(f"Using local critic at {critic_url} (will auto-detect model)")
-        critic = LocalCritic(base_url=critic_url, model=critic_model)  # Pass None to auto-detect
+        critic = LocalCritic(backend="local", base_url=critic_url, model=critic_model)
+    elif critic_provider == "openrouter":
+        # Use OpenRouter critic
+        logger.info(f"Using OpenRouter critic")
+        critic = LocalCritic(backend="openrouter", model=critic_model)
     else:
-        # Use API-based critic (anthropic or openai)
-        api_key = None
-        if critic_provider == "anthropic":
-            api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY")
-        elif critic_provider == "openai":
-            api_key = os.environ.get("OPENAI_API_KEY")
-        
-        if not api_key:
-            raise ValueError(f"API key not found. Set {critic_provider.upper()}_API_KEY environment variable.")
-        
-        if critic_model is None:
-            if critic_provider == "anthropic":
-                critic_model = "claude-sonnet-4-20250514"
-            elif critic_provider == "openai":
-                critic_model = "gpt-4"
-        
-        critic = LLMCritic(critic_provider, critic_model, api_key=api_key)
+        raise ValueError(f"Invalid critic_provider: {critic_provider}. Must be 'local' or 'openrouter'")
     
     # Setup generator with inference provider
     if use_rag:
@@ -914,13 +961,15 @@ def example_usage(
         generated_response = result['response']
         attempts = result['attempts']
         final_score = result['final_score']
+        if final_score is not None and final_score <7.0:
+            print(f"Final score: {final_score:.1f} - STALE")
         
         print(f"Generated response: {generated_response}")
         print(f"Attempts: {attempts}, Final score: {final_score:.1f}")
         
-        if result['critic_results']:
-            print(f"\nCritic analysis:")
-            print(result['critic_results'][-1].display())
+        #if result['critic_results']:
+        #    print(f"\nCritic analysis:")
+        #    print(result['critic_results'][-1].display())
         
         print()
 
@@ -941,8 +990,8 @@ Examples:
   # Use custom prompts file
   python aliveness_critic.py --checkpoint ./sft_output/final --prompts eval_prompts.txt
   
-  # Use OpenAI critic instead of Anthropic
-  python aliveness_critic.py --checkpoint ./sft_output/final --critic-provider openai --critic-model gpt-4
+  # Use OpenRouter critic instead of local
+  python aliveness_critic.py --checkpoint ./sft_output/final --critic-provider openrouter --critic-model anthropic/claude-sonnet-4
   
   # Use RAG provider with local vLLM backend
   python aliveness_critic.py --use-rag --rag-backend local --prompts eval_prompts.txt
@@ -972,14 +1021,14 @@ Examples:
         "--critic-provider",
         type=str,
         default="local",
-        choices=["local", "anthropic", "openai"],
-        help="Critic provider: 'local' (vLLM port 5000), 'anthropic', or 'openai' (default: local)"
+        choices=["local", "openrouter"],
+        help="Critic provider: 'local' (vLLM port 5000) or 'openrouter' (default: local)"
     )
     parser.add_argument(
         "--critic-model",
         type=str,
         default=None,
-        help="Critic model name (default: auto-detect for local, claude-sonnet-4-20250514 for anthropic, gpt-4 for openai)"
+        help="Critic model name (default: auto-detect for local, anthropic/claude-sonnet-4 for openrouter)"
     )
     parser.add_argument(
         "--critic-url",
