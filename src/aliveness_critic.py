@@ -803,6 +803,123 @@ class ContemplativeGenerator:
                 "critic_results": critic_results,
             }
     
+    def expand(self, query: str, response: str) -> Optional[str]:
+        """
+        Expand a generated response into a longer, less abstract response 
+        in the form of a Face_to_Face quote.
+        
+        Args:
+            query: The original user query
+            response: The generated response to expand
+            
+        Returns:
+            Expanded response string, or None if generation fails
+        """
+        # Check if RAG provider is available and has Face_to_Face access
+        is_rag_provider = (
+            ContemplativeRAGProvider is not None
+            and self.inference_provider is not None
+            and isinstance(self.inference_provider, ContemplativeRAGProvider)
+        )
+        
+        if is_rag_provider:
+            # Use RAG provider with Face_to_Face quotes
+            face_to_face_passages = self.inference_provider.query_passages(query+'. '+response, top_n=4 )
+            
+            # Build expansion prompt - add generated_response and ask for longer, less abstract response
+            prompt_parts = ["You are a helpful assistant expanding on a response to a user query."]
+            prompt_parts.append("Original query:")
+            prompt_parts.append(query)
+            prompt_parts.append("")
+            prompt_parts.append("Your initial response:")
+            prompt_parts.append(response)
+            prompt_parts.append("")
+            
+            if face_to_face_passages:
+                prompt_parts.append("Relevant passages from Face_to_Face with Bhagavan:\n")
+                for passage in face_to_face_passages:
+                    prompt_parts.append(passage)
+                    prompt_parts.append("")
+            
+            prompt_parts.append("Expand on the original response into a longer, less abstract form, in the style of the Face_to_Face included quotes above.")
+            prompt_parts.append("Do NOT repeat the original response, the goal it to make it more accessible to those not familiar with all of Bhagavan's teachings.")
+            prompt_parts.append("End your response with: </end>")
+            
+            expand_prompt = "\n".join(prompt_parts)
+            
+            try:
+                results = self.inference_provider.generate_from_prompt(
+                    prompt=expand_prompt,
+                    max_new_tokens=500,
+                    temperature=0.5,
+                    stop_sequence="</end>",
+                )
+                result_array = results.split('\n')
+                for item in result_array:
+                    if item.strip():
+                        return item.strip()
+                return None
+            except Exception as e:
+                logger.warning(f"Expansion failed: {e}")
+                return None
+        else:
+            # Standard provider - build prompt with generated response
+            expand_prompt = f"""Original response:
+{response}
+
+Expand this into a longer, less abstract response in the style of Ramana Maharshi's teachings from Face_to_Face. 
+Maintain the direct, pointing style. Make it more concrete and less abstract."""
+            
+            messages = [{"role": "user", "content": expand_prompt}]
+            
+            if self.inference_provider is not None:
+                try:
+                    return self.inference_provider.generate_from_messages(
+                        messages=messages,
+                        max_new_tokens=500,
+                        temperature=0.7,
+                    )
+                except Exception as e:
+                    logger.warning(f"Expansion failed: {e}")
+                    return None
+            
+            # Fallback to HTTP API
+            try:
+                resp = self.http_client.post(
+                    f"{self.generator_url}/chat/completions",
+                    json={
+                        "model": self.generator_model,
+                        "messages": messages,
+                        "max_tokens": 500,
+                        "temperature": 0.7,
+                    }
+                )
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+            except Exception as e:
+                logger.warning(f"Expansion failed: {e}")
+                return None
+    
+    def explain(
+        self,
+        query: str,
+        response: str,
+        expansion: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Explain a generated response.
+        
+        Args:
+            query: The original user query
+            response: The generated response to explain
+            expansion: Optional expansion of the response
+            
+        Returns:
+            Explanation string, or None if generation fails
+        """
+        # TODO: Implement explanation logic
+        return None
+    
     def _generate_candidate(
         self,
         user_input: str,
@@ -820,7 +937,6 @@ class ContemplativeGenerator:
                     messages=messages,
                     max_new_tokens=450,
                     temperature=temperature,
-                    do_sample=True,
                 )
             except Exception as e:
                 logger.warning(f"Local generation failed: {e}")
@@ -966,13 +1082,13 @@ def example_usage(
         
         print(f"Generated response: {generated_response}")
         print(f"Attempts: {attempts}, Final score: {final_score:.1f}")
-        
-        #if result['critic_results']:
-        #    print(f"\nCritic analysis:")
-        #    print(result['critic_results'][-1].display())
-        
-        print()
 
+        expansion = generator.expand(query=prompt, response=generated_response)
+        print(f"Expansion: {expansion}")
+        
+        explanation = generator.explain(query=prompt, response=generated_response, expansion=expansion)
+        print(f"Explanation: {explanation}\n")
+        
 
 def main():
     """Command-line interface for aliveness critic."""

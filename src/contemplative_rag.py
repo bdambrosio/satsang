@@ -644,7 +644,38 @@ Bhagavan:
             logger.warning("No responses parsed, returning empty string")
             return ""
     
-    def _call_local(self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, do_sample: bool) -> str:
+    def generate_from_prompt(
+        self,
+        prompt: str,
+        max_new_tokens: int = 500,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop_sequence: str = "</end>",
+    ) -> str:
+        """
+        Generate a response from a raw prompt, dispatching to backend.
+        
+        This is a simple wrapper around _call_local and _call_openrouter
+        that doesn't build RAG prompts or parse multi-response format.
+        
+        Args:
+            prompt: Raw prompt text
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            do_sample: Whether to use sampling
+        
+        Returns:
+            Generated response text (raw string)
+        """
+        if self.backend == "local":
+            return self._call_local(prompt, max_new_tokens, temperature, top_p, stop_sequence)
+        elif self.backend == "openrouter":
+            return self._call_openrouter(prompt, max_new_tokens, temperature, top_p, stop_sequence)
+        else:
+            raise ValueError(f"Unknown backend: {self.backend}")
+    
+    def _call_local(self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, stop_sequence: str) -> str:
         """Call local vLLM API."""
         try:
             resp = self.http_client.post(
@@ -657,7 +688,7 @@ Bhagavan:
                     "max_tokens": max_new_tokens,
                     "temperature": temperature,
                     "top_p": top_p,
-                    "do_sample": do_sample,
+                    "stop_sequence": stop_sequence,
                 }
             )
             resp.raise_for_status()
@@ -666,7 +697,7 @@ Bhagavan:
             logger.error(f"Local API call failed: {e}")
             raise
     
-    def _call_openrouter(self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, do_sample: bool) -> str:
+    def _call_openrouter(self, prompt: str, max_new_tokens: int, temperature: float, top_p: float, stop_sequence: str) -> str:
         """Call OpenRouter API."""
         if not self.model:
             raise ValueError("Model name required for OpenRouter backend")
@@ -691,6 +722,7 @@ Bhagavan:
                     "max_tokens": max_new_tokens,
                     "temperature": temperature,
                     "top_p": top_p,
+                    "stop_sequence": stop_sequence,
                 }
             )
             resp.raise_for_status()
