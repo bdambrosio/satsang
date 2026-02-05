@@ -88,14 +88,13 @@ except Exception as e:
 try:
     import contemplative_rag
     ContemplativeRAGProvider = contemplative_rag.ContemplativeRAGProvider
+    NAN_YAR = contemplative_rag.NAN_YAR
 except ImportError as e:
     ContemplativeRAGProvider = None
     logger.debug(f"ContemplativeRAGProvider not available (ImportError): {e}")
 except Exception as e:
     ContemplativeRAGProvider = None
     logger.debug(f"ContemplativeRAGProvider not available: {e}")
-
-nan_yar=""""""
 
 # =============================================================================
 # CRITIC PROMPTS
@@ -806,7 +805,7 @@ class ContemplativeGenerator:
     def expand(self, query: str, response: str) -> Optional[str]:
         """
         Expand a generated response into a longer, less abstract response 
-        in the form of a Face_to_Face quote.
+        in the form of passages from Commentaries.
         
         Args:
             query: The original user query
@@ -815,7 +814,7 @@ class ContemplativeGenerator:
         Returns:
             Expanded response string, or None if generation fails
         """
-        # Check if RAG provider is available and has Face_to_Face access
+        # Check if RAG provider is available and has passages access
         is_rag_provider = (
             ContemplativeRAGProvider is not None
             and self.inference_provider is not None
@@ -823,8 +822,8 @@ class ContemplativeGenerator:
         )
         
         if is_rag_provider:
-            # Use RAG provider with Face_to_Face quotes
-            face_to_face_passages = self.inference_provider.query_passages(query+'. '+response, top_n=4 )
+            # Use RAG provider with Commentaries passages
+            commentaries_passages = self.inference_provider.query_passages(query+'. '+response, top_n=4 )
             
             # Build expansion prompt - add generated_response and ask for longer, less abstract response
             prompt_parts = ["You are a helpful assistant expanding on a response to a user query."]
@@ -835,14 +834,24 @@ class ContemplativeGenerator:
             prompt_parts.append(response)
             prompt_parts.append("")
             
-            if face_to_face_passages:
-                prompt_parts.append("Relevant passages from Face_to_Face with Bhagavan:\n")
-                for passage in face_to_face_passages:
+            prompt_parts.append("Nam Yar is a core text of Bhagavan's teachings:")
+            prompt_parts.append(NAN_YAR)
+            prompt_parts.append("")
+            if commentaries_passages:
+                prompt_parts.append("Possibly relevant passages from Commentaries:\n")
+                for passage in commentaries_passages:
                     prompt_parts.append(passage)
                     prompt_parts.append("")
             
-            prompt_parts.append("Expand on the original response into a longer, less abstract form, in the style of the Face_to_Face included quotes above.")
-            prompt_parts.append("Do NOT repeat the original response, the goal it to make it more accessible to those not familiar with all of Bhagavan's teachings.")
+            prompt_parts.append("Expand on the original response into a longer, less abstract form, in the style of the Commentaries passages included above")
+            prompt_parts.append("")
+            prompt_parts.append("Original query:")
+            prompt_parts.append(query)
+            prompt_parts.append("")
+            prompt_parts.append("Your initial response:")
+            prompt_parts.append(response)
+            prompt_parts.append("")            
+            prompt_parts.append("Do NOT repeat the original response, the goal it to make it more accessible to those not familiar with all of Bhagavan's teachings. Write 2 - 3 sentences, in the more informal style of Bhagavan's statements in the Commentaries passages included above.")
             prompt_parts.append("End your response with: </end>")
             
             expand_prompt = "\n".join(prompt_parts)

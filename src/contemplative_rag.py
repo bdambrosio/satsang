@@ -53,92 +53,7 @@ try:
 except ImportError:
     raise ImportError("pip install sentence-transformers")
 
-
-class ContemplativeRAGProvider:
-    """
-    RAG-based inference provider for contemplative dialogue.
-    
-    Matches Phi2InferenceProvider interface for compatibility with aliveness_critic.
-    """
-    
-    def __init__(
-        self,
-        jsonl_path: str = "./ramana/Talks-with-Sri-Ramana-Maharshi-parsed-reviewed-merged.jsonl",
-        face_to_face_path: Optional[str] = "./ramana/Face_to_Face_with_Sri_Ramana_Maharshi.txt",
-        backend: str = "local",  # "local" or "openrouter"
-        model: Optional[str] = None,
-        local_url: str = "http://localhost:5000/v1",
-        top_k: int = 3,
-        embedding_model: str = "all-MiniLM-L6-v2",
-        custom_prompt_prefix: Optional[str] = None,
-        max_paragraph_chars: int = 2000,
-    ):
-        """
-        Initialize RAG provider.
-        
-        Args:
-            jsonl_path: Path to Talks-parsed_reviewed.jsonl
-            face_to_face_path: Path to Face_to_Face_with_Sri_Ramana_Maharshi.txt (optional)
-            backend: "local" (vLLM) or "openrouter"
-            model: Model name (optional - defaults to "anthropic/claude-sonnet-4" for openrouter)
-            local_url: Local vLLM API URL
-            top_k: Number of Q&A pairs to retrieve
-            embedding_model: Sentence transformer model for embeddings
-            custom_prompt_prefix: Optional text to insert before query (user will edit)
-            max_paragraph_chars: Maximum characters per paragraph in Face_to_Face index (default: 2000)
-        """
-        self.backend = backend
-        # Hardcode default model for openrouter
-        if backend == "openrouter" and model is None:
-            self.model = "anthropic/claude-sonnet-4"
-        else:
-            self.model = model
-        self.local_url = local_url
-        self.top_k = top_k
-        self.custom_prompt_prefix = custom_prompt_prefix or ""
-        self.max_paragraph_chars = max_paragraph_chars
-        
-        # Setup HTTP client
-        self.http_client = httpx.Client(timeout=120.0)
-        
-        # Load embedding model
-        logger.info(f"Loading embedding model: {embedding_model}")
-        self.embedder = SentenceTransformer(embedding_model)
-        
-        # Load and index Q&A pairs
-        logger.info(f"Loading Q&A pairs from {jsonl_path}")
-        self.qa_pairs = self._load_qa_pairs(jsonl_path)
-        logger.info(f"Loaded {len(self.qa_pairs)} Q&A pairs")
-        
-        # Build FAISS index for Q&A pairs
-        logger.info("Building FAISS index for Q&A pairs...")
-        self.index, self.questions = self._build_index()
-        logger.info(f"FAISS index built: {self.index.ntotal} vectors")
-        
-        # Load and index Face_to_Face passages if provided
-        self.face_to_face_passages = []
-        self.face_to_face_index = None
-        if face_to_face_path:
-            logger.info(f"Loading Face_to_Face passages from {face_to_face_path}")
-            self.face_to_face_passages = self._load_face_to_face_passages(face_to_face_path)
-            logger.info(f"Loaded {len(self.face_to_face_passages)} passages")
-            if self.face_to_face_passages:
-                logger.info("Building FAISS index for Face_to_Face passages...")
-                self.face_to_face_index = self._build_face_to_face_index()
-                logger.info(f"Face_to_Face FAISS index built: {self.face_to_face_index.ntotal} vectors")
-        
-        # Auto-detect model if using local backend
-        if backend == "local" and model is None:
-            self.model = self._detect_local_model()
-            logger.info(f"Auto-detected local model: {self.model}")
-
-        if not custom_prompt_prefix:
-            self.custom_prompt_prefix = """You are a contemplative teacher. You are 'answering' questions about the teachings of Ramana Maharshi.
-Your goal is to transmit the teachings of Ramana Maharshi in a way that is helpful and insightful for the user. This will often mean responding to the question in a way that is intended to direct the user back to the self, rather that the usual expositional style of classroom teaching. Do not to give advice or tell the user what to do. Do not to be pedantic or overly technical. You may choose to respond with a relevant quote from Nam Yar or an anecdote from Face_to_Face with Sri Ramana Maharshi.
-
-Focus always on Ramana Maharshi's teachings as given in Nam Yar:
-
-Since all sentient beings like [love or want] to be always happy without what is called misery, since for everyone the greatest love is only for oneself, and since happiness alone is the cause for love, [in order] to obtain that happiness, which is one’s svabhāva [own being, existence or nature], which one experiences daily in [dreamless] sleep, which is devoid of mind, oneself knowing oneself is necessary. For that, jñāna-vicāra [awareness-investigation] called ‘who am I’ alone is the principal means.
+NAN_YAR="""Since all sentient beings like [love or want] to be always happy without what is called misery, since for everyone the greatest love is only for oneself, and since happiness alone is the cause for love, [in order] to obtain that happiness, which is one’s svabhāva [own being, existence or nature], which one experiences daily in [dreamless] sleep, which is devoid of mind, oneself knowing oneself is necessary. For that, jñāna-vicāra [awareness-investigation] called ‘who am I’ alone is the principal means.
 
 Who am I? The sthūla dēha [the ‘gross’ or physical body], which is [formed] by sapta dhātus [seven constituents, namely chyle, blood, flesh, fat, bone, marrow and semen], is not I. The five jñānēndriyas [sense organs], namely ears, skin, eyes, tongue and nose, which individually [and respectively] know the five viṣayas [‘domains’ or kinds of sensory phenomena], namely sound, touch [texture and other qualities perceived by touch], form [shape, colour and other qualities perceived by sight], taste and smell, are also not I. The five karmēndriyas [organs of action], namely mouth, feet [or legs], hands [or arms], anus and genitals, which [respectively] do the five actions, namely speaking, going [moving or walking], giving, discharge of faeces and enjoying [sexual pleasure], are also not I. The pañca vāyus [the five ‘winds’, ‘vital airs’ or metabolic processes], beginning with prāṇa [breath], which do the five [metabolic] functions, beginning with respiration, are also not I. The mind, which thinks, is also not I. All viṣayas [phenomena] and all actions ceasing [as in sleep or any other state of manōlaya], the ignorance [namely absence of awareness of any phenomena] that is combined only with viṣaya-vāsanās [inclinations to experience phenomena] is also not I. Eliminating everything mentioned above as not I, not I, the awareness that stands separated [or isolated] alone is I. The nature of [such] awareness is sat-cit-ānanda [being-awareness-bliss].
 
@@ -175,6 +90,105 @@ Besides the saying that waking is dīrgha [long lasting] and dream is kṣaṇik
 There are not two minds, namely a good mind and a bad mind. Mind is only one. Only vāsanās [inclinations or propensities] are of two kinds, namely śubha [agreeable, virtuous or good] and aśubha [disagreeable, wicked, harmful or bad]. When mind is under the sway of śubha vāsanās it is said to be a good mind, and when it is under the sway of aśubha vāsanās a bad mind. However bad other people may appear to be, disliking them is not proper [or appropriate]. Likes and dislikes are both fit [for one] to dislike [spurn or renounce]. It is not appropriate to allow the mind [to dwell] excessively on worldly matters. To the extent possible, it is not appropriate to intrude in others’ affairs. All that one gives to others one is giving only to oneself. If one knew this truth, who indeed would remain without giving?
 
 If oneself rises [or appears] [as ego or mind], everything rises [or appears]; if oneself subsides [disappears or ceases], everything subsides [disappears or ceases]. To whatever extent sinking low [subsiding or being humble] we behave [or conduct ourself], to that extent there is goodness [benefit or virtue]. If one is [continuously] restraining [curbing or subduing] mind, wherever one may be one can be [or let one be].
+"""
+class ContemplativeRAGProvider:
+    """
+    RAG-based inference provider for contemplative dialogue.
+    
+    Matches Phi2InferenceProvider interface for compatibility with aliveness_critic.
+    """
+    
+    def __init__(
+        self,
+        jsonl_path: Optional[str] = None,  # Optional - kept for future merging
+        commentaries_path: Optional[str] = "./ramana/Commentaries_qa_excert.txt",
+        backend: str = "local",  # "local" or "openrouter"
+        model: Optional[str] = None,
+        local_url: str = "http://localhost:5000/v1",
+        top_k: int = 3,
+        embedding_model: str = "all-MiniLM-L6-v2",
+        custom_prompt_prefix: Optional[str] = None,
+        max_paragraph_chars: int = 2000,
+    ):
+        """
+        Initialize RAG provider.
+        
+        Args:
+            jsonl_path: Path to Talks-parsed_reviewed.jsonl (optional - kept for future merging)
+            commentaries_path: Path to Commentaries_qa_excert.txt (default: ./ramana/Commentaries_qa_excert.txt)
+            backend: "local" (vLLM) or "openrouter"
+            model: Model name (optional - defaults to "anthropic/claude-sonnet-4" for openrouter)
+            local_url: Local vLLM API URL
+            top_k: Number of Q&A pairs to retrieve
+            embedding_model: Sentence transformer model for embeddings
+            custom_prompt_prefix: Optional text to insert before query (user will edit)
+            max_paragraph_chars: Maximum characters per paragraph in passages index (default: 2000)
+        """
+        self.backend = backend
+        # Hardcode default model for openrouter
+        if backend == "openrouter" and model is None:
+            self.model = "anthropic/claude-sonnet-4"
+        else:
+            self.model = model
+        self.local_url = local_url
+        self.top_k = top_k
+        self.custom_prompt_prefix = custom_prompt_prefix or ""
+        self.max_paragraph_chars = max_paragraph_chars
+        
+        # Setup HTTP client
+        self.http_client = httpx.Client(timeout=120.0)
+        
+        # Load embedding model
+        logger.info(f"Loading embedding model: {embedding_model}")
+        self.embedder = SentenceTransformer(embedding_model)
+        
+        # Load and index Q&A pairs and passages from Commentaries
+        self.qa_pairs = []
+        self.face_to_face_passages = []
+        self.face_to_face_index = None
+        
+        if commentaries_path:
+            logger.info(f"Loading Commentaries from {commentaries_path}")
+            commentaries_qa, commentaries_passages = self._load_commentaries(commentaries_path)
+            self.qa_pairs = commentaries_qa
+            self.face_to_face_passages = commentaries_passages
+            logger.info(f"Loaded {len(self.qa_pairs)} Q&A pairs and {len(self.face_to_face_passages)} passages from Commentaries")
+        elif jsonl_path:
+            # Fallback to JSONL if Commentaries not provided (kept for future merging)
+            logger.info(f"Loading Q&A pairs from JSONL: {jsonl_path}")
+            self.qa_pairs = self._load_qa_pairs(jsonl_path)
+            logger.info(f"Loaded {len(self.qa_pairs)} Q&A pairs from JSONL")
+        else:
+            logger.warning("No data source provided (neither commentaries_path nor jsonl_path)")
+        
+        # Build FAISS index for Q&A pairs
+        if self.qa_pairs:
+            logger.info("Building FAISS index for Q&A pairs...")
+            self.index, self.questions = self._build_index()
+            logger.info(f"FAISS index built: {self.index.ntotal} vectors")
+        else:
+            self.index = None
+            self.questions = []
+            logger.warning("No Q&A pairs loaded - FAISS index not built")
+        
+        # Build FAISS index for passages if available
+        if self.face_to_face_passages:
+            logger.info("Building FAISS index for passages...")
+            self.face_to_face_index = self._build_face_to_face_index()
+            logger.info(f"Passages FAISS index built: {self.face_to_face_index.ntotal} vectors")
+        
+        # Auto-detect model if using local backend
+        if backend == "local" and model is None:
+            self.model = self._detect_local_model()
+            logger.info(f"Auto-detected local model: {self.model}")
+
+        if not custom_prompt_prefix:
+            self.custom_prompt_prefix = f"""You are a contemplative teacher. You are 'answering' questions about the teachings of Ramana Maharshi.
+Your goal is to transmit the teachings of Ramana Maharshi in a way that is helpful and insightful for the user. This will often mean responding to the question in a way that is intended to direct the user back to the self, rather that the usual expositional style of classroom teaching. Do not to give advice or tell the user what to do. Do not to be pedantic or overly technical. You may choose to respond with a relevant quote from Nan Yar or passages from the Commentaries.
+
+Focus always on Ramana Maharshi's teachings as given in Nam Yar:
+
+{NAN_YAR}
 
 #################
 """
@@ -267,8 +281,152 @@ If oneself rises [or appears] [as ego or mind], everything rises [or appears]; i
         
         return results
     
+    def _load_commentaries(self, txt_path: str) -> tuple[list[dict], list[str]]:
+        """
+        Load Q&A pairs and passages from Commentaries_qa_excert.txt.
+        
+        Format:
+        - Q/A entries: "(n1-n2) Q: <question>\nA: <answer>"
+        - Passage entries: "(n1-n2) <text>"
+        - Entries separated by blank lines
+        
+        Returns:
+            (qa_pairs, passages) where:
+            - qa_pairs: list of {"question": str, "answer": str, "source_id": str}
+            - passages: list of passage strings
+        """
+        import re
+        
+        qa_pairs = []
+        passages = []
+        path = Path(txt_path)
+        
+        if not path.exists():
+            logger.warning(f"Commentaries file not found: {txt_path}")
+            return qa_pairs, passages
+        
+        # Pattern to match entry header: "(n1-n2)"
+        entry_pattern = re.compile(r'^\((\d+)-(\d+)\)\s*(.*)$')
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            current_entry_lines = []
+            current_entry_id = None
+            
+            for line_num, line in enumerate(f, 1):
+                line = line.rstrip('\n\r')
+                
+                # Blank line marks end of entry
+                if not line.strip():
+                    if current_entry_lines and current_entry_id:
+                        self._process_commentaries_entry(
+                            current_entry_id,
+                            current_entry_lines,
+                            qa_pairs,
+                            passages,
+                            line_num
+                        )
+                    current_entry_lines = []
+                    current_entry_id = None
+                    continue
+                
+                # Check if this is a new entry header
+                match = entry_pattern.match(line)
+                if match:
+                    # Process previous entry if exists
+                    if current_entry_lines and current_entry_id:
+                        self._process_commentaries_entry(
+                            current_entry_id,
+                            current_entry_lines,
+                            qa_pairs,
+                            passages,
+                            line_num
+                        )
+                    
+                    # Start new entry
+                    n1, n2, rest = match.groups()
+                    current_entry_id = f"({n1}-{n2})"
+                    current_entry_lines = [rest] if rest.strip() else []
+                else:
+                    # Continuation of current entry
+                    if current_entry_lines is not None:
+                        current_entry_lines.append(line)
+            
+            # Process last entry
+            if current_entry_lines and current_entry_id:
+                self._process_commentaries_entry(
+                    current_entry_id,
+                    current_entry_lines,
+                    qa_pairs,
+                    passages,
+                    line_num + 1
+                )
+        
+        return qa_pairs, passages
+    
+    def _process_commentaries_entry(
+        self,
+        entry_id: str,
+        lines: list[str],
+        qa_pairs: list[dict],
+        passages: list[str],
+        line_num: int
+    ):
+        """Process a single Commentaries entry and add to qa_pairs or passages."""
+        if not lines:
+            logger.warning(f"Empty entry {entry_id} at line {line_num}, skipping")
+            return
+        
+        # Check if first line contains " Q: " (Q/A entry type)
+        first_line = lines[0].strip()
+        if " Q: " in first_line:
+            # Q/A entry type
+            # Extract question from first line (everything after " Q: ")
+            q_match = re.search(r'\s+Q:\s+(.+)$', first_line)
+            if not q_match:
+                logger.warning(f"Invalid Q/A entry {entry_id} at line {line_num}: 'Q:' not found in expected format")
+                return
+            
+            question = q_match.group(1).strip()
+            
+            # Look for "A: " in remaining lines (usually second line)
+            answer = None
+            for i, line in enumerate(lines[1:], start=1):
+                if line.strip().startswith("A:"):
+                    # Extract answer (everything after "A: ")
+                    answer = line.replace("A:", "", 1).strip()
+                    # If answer continues on next lines, join them
+                    if i + 1 < len(lines):
+                        remaining_lines = [l.strip() for l in lines[i + 1:] if l.strip()]
+                        if remaining_lines:
+                            answer += " " + " ".join(remaining_lines)
+                    break
+            
+            if question and answer:
+                qa_pairs.append({
+                    "question": question,
+                    "answer": answer,
+                    "source_id": entry_id,
+                })
+            else:
+                logger.warning(
+                    f"Invalid Q/A entry {entry_id} at line {line_num}: "
+                    f"question={bool(question)}, answer={bool(answer)}"
+                )
+        else:
+            # Passage entry type (no " Q: " marker)
+            passage_text = ' '.join(lines).strip()
+            if self._is_valid_passage(passage_text):
+                passages.append(passage_text)
+            else:
+                logger.warning(f"Invalid passage entry {entry_id} at line {line_num}: failed validation")
+    
     def _load_face_to_face_passages(self, txt_path: str) -> list[str]:
-        """Load passages from Face_to_Face text file, filtering by rules."""
+        """
+        Load passages from Face_to_Face text file, filtering by rules.
+        
+        NOTE: Kept for backward compatibility and future merging.
+        Replaced by _load_commentaries() for new Commentaries format.
+        """
         passages = []
         path = Path(txt_path)
         
@@ -423,14 +581,14 @@ If oneself rises [or appears] [as ego or mind], everything rises [or appears]; i
         
         context_text = "\n".join(context_parts)
         
-        # Query Face_to_Face passages
-        face_to_face_passages = self.query_passages(query, top_n=5)
-        face_to_face_parts = []
-        for passage in face_to_face_passages:
-            face_to_face_parts.append(f"{passage}")
-            face_to_face_parts.append("")
+        # Query passages from Commentaries
+        commentaries_passages = self.query_passages(query, top_n=5)
+        commentaries_parts = []
+        for passage in commentaries_passages:
+            commentaries_parts.append(f"{passage}")
+            commentaries_parts.append("")
         
-        face_to_face_text = "\n".join(face_to_face_parts)
+        commentaries_text = "\n".join(commentaries_parts)
  
          # Build full prompt
         prompt_parts = []
@@ -440,10 +598,10 @@ If oneself rises [or appears] [as ego or mind], everything rises [or appears]; i
             prompt_parts.append(self.custom_prompt_prefix)
             prompt_parts.append("")
         
-        # Retrieved Face_to_Face passages
-        if face_to_face_text:
-            prompt_parts.append("Possibly relevant passages from Face_to_Face with Bhagavan:")
-            prompt_parts.append(face_to_face_text)
+        # Retrieved passages from Commentaries
+        if commentaries_text:
+            prompt_parts.append("Possibly relevant passages from Commentaries:")
+            prompt_parts.append(commentaries_text)
             prompt_parts.append("")
 
         # Retrieved context
