@@ -219,7 +219,9 @@ phi2-contemplative-lora/
 
 # Data Directories
 prepared_data/
-filtered_guten/
+filtered_guten/*/
+filtered_guten/*.jsonl
+filtered_guten/*.json
 microsoft/
 sft_output/
 *.zip
