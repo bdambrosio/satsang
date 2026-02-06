@@ -222,6 +222,7 @@ prepared_data/
 filtered_guten/*/
 filtered_guten/*.jsonl
 filtered_guten/*.json
+filtered_passages/
 microsoft/
 sft_output/
 *.zip

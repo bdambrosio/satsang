@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ramana Maharshi</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Ramana Maharshi</h1>
+        </header>
+
+        <!-- Nan_Yar Passage Section -->
+        <section class="nan-yar-section">
+            <div id="nan-yar-passage" class="nan-yar-passage">
+                <p>Loading...</p>
+            </div>
+        </section>
+
+        <!-- Main Content Area -->
+        <div class="main-layout">
+            <main class="main-content">
+                <section class="query-section">
+                    <h2>Ask a Question</h2>
+                    <form id="query-form">
+                        <textarea 
+                            id="query-input" 
+                            name="query" 
+                            placeholder="Enter your question..."
+                            rows="4"
+                            required
+                        ></textarea>
+                        <button type="submit" id="submit-btn">Submit</button>
+                    </form>
+                </section>
+
+                <section class="response-section" id="response-section" style="display: none;">
+                    <h2>Response</h2>
+                    <div id="response-text" class="response-text"></div>
+                </section>
+
+                <section class="expanded-response-section" id="expanded-response-section" style="display: none;">
+                    <h2>Expanded Response</h2>
+                    <div id="expanded-response-text" class="expanded-response-text"></div>
+                </section>
+            </main>
+
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <h2>Related Passages</h2>
+                <div id="passages-list" class="passages-list">
+                    <p class="empty-message">Submit a question to see related passages.</p>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <script>
+        // Load random Nan_Yar passage on page load
+        async function loadNanYar() {
+            try {
+                const response = await fetch('/api/nan-yar');
+                const data = await response.json();
+                
+                if (data.passage) {
+                    document.getElementById('nan-yar-passage').innerHTML = 
+                        '<p>' + data.passage.replace(/\n/g, '<br>') + '</p>';
+                } else {
+                    document.getElementById('nan-yar-passage').innerHTML = 
+                        '<p>Unable to load passage.</p>';
+                }
+            } catch (error) {
+                console.error('Error loading Nan_Yar:', error);
+                document.getElementById('nan-yar-passage').innerHTML = 
+                    '<p>Error loading passage.</p>';
+            }
+        }
+
+        // Handle form submission
+        document.getElementById('query-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const queryInput = document.getElementById('query-input');
+            const submitBtn = document.getElementById('submit-btn');
+            const query = queryInput.value.trim();
+            
+            if (!query) {
+                return;
+            }
+            
+            // Disable form during request
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Processing...';
+            
+            // Clear previous responses
+            document.getElementById('response-section').style.display = 'none';
+            document.getElementById('expanded-response-section').style.display = 'none';
+            document.getElementById('passages-list').innerHTML = 
+                '<p class="loading-message">Loading...</p>';
+            
+            try {
+                // Generate response
+                const response = await fetch('/api/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ query: query }),
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                
+                // Display response
+                if (data.is_silence) {
+                    document.getElementById('response-text').textContent = 
+                        data.message || 'Silence is sometimes the most appropriate response.';
+                    document.getElementById('response-section').style.display = 'block';
+                } else {
+                    if (data.response) {
+                        document.getElementById('response-text').textContent = data.response;
+                        document.getElementById('response-section').style.display = 'block';
+                    }
+                    
+                    if (data.expanded_response) {
+                        document.getElementById('expanded-response-text').textContent = data.expanded_response;
+                        document.getElementById('expanded-response-section').style.display = 'block';
+                    }
+                }
+                
+                // Retrieve passages
+                await retrievePassages(query, data.response || '', data.expanded_response || '');
+                
+            } catch (error) {
+                console.error('Error:', error);
+                document.getElementById('passages-list').innerHTML = 
+                    '<p class="error-message">Error: ' + error.message + '</p>';
+            } finally {
+                // Re-enable form
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Submit';
+            }
+        });
+        
+        // Retrieve passages for sidebar
+        async function retrievePassages(userInput, response, expandedResponse) {
+            try {
+                const fetchResponse = await fetch('/api/retrieve-passages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        user_input: userInput,
+                        response: response,
+                        expanded_response: expandedResponse,
+                        top_k: 5,
+                    }),
+                });
+                
+                const data = await fetchResponse.json();
+                
+                if (data.error) {
+                    console.error('Retrieval error:', data.error);
+                    document.getElementById('passages-list').innerHTML = 
+                        '<p class="error-message">Error retrieving passages.</p>';
+                    return;
+                }
+                
+                const passages = data.passages || [];
+                
+                if (passages.length === 0) {
+                    document.getElementById('passages-list').innerHTML = 
+                        '<p class="empty-message">No related passages found.</p>';
+                    return;
+                }
+                
+                // Display passages
+                let html = '';
+                passages.forEach((passage) => {
+                    html += `
+                        <div class="passage-item">
+                            <div class="passage-meta">
+                                <span class="passage-author">${escapeHtml(passage.author || 'Unknown')}</span>
+                                <span class="passage-title">${escapeHtml(passage.title || 'Untitled')}</span>
+                                ${passage.tradition ? `<span class="passage-tradition">${escapeHtml(passage.tradition)}</span>` : ''}
+                            </div>
+                            <div class="passage-text">${escapeHtml(passage.text)}</div>
+                        </div>
+                    `;
+                });
+                
+                document.getElementById('passages-list').innerHTML = html;
+                
+            } catch (error) {
+                console.error('Error retrieving passages:', error);
+                document.getElementById('passages-list').innerHTML = 
+                    '<p class="error-message">Error retrieving passages.</p>';
+            }
+        }
+        
+        // Escape HTML to prevent XSS
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        // Load Nan_Yar on page load
+        loadNanYar();
+    </script>
+</body>
+</html>

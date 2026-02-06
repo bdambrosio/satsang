@@ -376,12 +376,12 @@ Focus always on Ramana Maharshi's teachings as given in Nam Yar:
             logger.warning(f"Empty entry {entry_id} at line {line_num}, skipping")
             return
         
-        # Check if first line contains " Q: " (Q/A entry type)
+        # Check if first line contains " Q: " or starts with "Q:" (Q/A entry type)
         first_line = lines[0].strip()
-        if " Q: " in first_line:
+        if " Q: " in first_line or first_line.startswith("Q:"):
             # Q/A entry type
-            # Extract question from first line (everything after " Q: ")
-            q_match = re.search(r'\s+Q:\s+(.+)$', first_line)
+            # Extract question from first line (everything after " Q: " or "Q:")
+            q_match = re.search(r'(?:^|\s+)Q:\s+(.+)$', first_line)
             if not q_match:
                 logger.warning(f"Invalid Q/A entry {entry_id} at line {line_num}: 'Q:' not found in expected format")
                 return

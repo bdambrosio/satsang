@@ -10,16 +10,21 @@ Pass 2: LLM judgment — full passage text sent for borderline cases.
   Everything between the two thresholds gets a yes/no call with the
   actual passage text, not just the thread descriptions.
 
+Incremental: reads any existing corpus.jsonl to skip already-filtered
+passages.  Each run writes a timestamped file under filtered_passages/runs/,
+then rebuilds the merged filtered_passages/corpus.jsonl from all run files.
+
 Usage:
-  python test_thread_filter.py --passages passages_samples.jsonl
-  python test_thread_filter.py --passages passages_samples.jsonl --reject 0.35 --accept 0.55
-  python test_thread_filter.py --passages passages_samples.jsonl --no-llm
+  python filter_passages.py --passages passages_sample.jsonl
+  python filter_passages.py --passages passages_sample.jsonl --reject 0.35 --accept 0.55
+  python filter_passages.py --passages passages_sample.jsonl --no-llm
 """
 
 import json
 import argparse
 import numpy as np
 import requests
+from datetime import datetime, timezone
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 
@@ -28,6 +33,11 @@ VLLM_BASE = "http://0.0.0.0:5000/v1"
 # ── Thresholds ─────────────────────────────────────────────────────────
 DEFAULT_REJECT = 0.35
 DEFAULT_ACCEPT = 0.55
+
+# ── Output paths ───────────────────────────────────────────────────────
+OUTPUT_DIR = Path("filtered_passages")
+RUNS_DIR = OUTPUT_DIR / "runs"
+CORPUS_FILE = OUTPUT_DIR / "corpus.jsonl"
 
 # ── Theme glosses ──────────────────────────────────────────────────────
 
@@ -178,6 +188,55 @@ def load_passages(path: str) -> list[dict]:
     return passages
 
 
+def load_existing_ids() -> set[str]:
+    """Load passage_ids already present in corpus.jsonl (if it exists)."""
+    ids = set()
+    if CORPUS_FILE.exists():
+        with open(CORPUS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rec = json.loads(line)
+                        pid = rec.get("passage_id")
+                        if pid:
+                            ids.add(pid)
+                    except json.JSONDecodeError:
+                        continue
+    return ids
+
+
+def rebuild_corpus():
+    """Rebuild corpus.jsonl by merging all run files, deduplicating by passage_id."""
+    seen = set()
+    records = []
+    if not RUNS_DIR.exists():
+        return
+    for run_file in sorted(RUNS_DIR.glob("*.jsonl")):
+        with open(run_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pid = rec.get("passage_id")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    records.append(line)
+    with open(CORPUS_FILE, "w") as f:
+        for line in records:
+            f.write(line + "\n")
+    return len(records)
+
+
+def clean_record(p: dict) -> dict:
+    """Return passage record without internal scoring fields."""
+    return {k: v for k, v in p.items() if not k.startswith("_")}
+
+
 def compute_best_similarity(threads: list[str], model, theme_vecs, theme_names):
     """Return (best_sim, best_theme, per-thread details)."""
     if not threads:
@@ -204,7 +263,7 @@ def compute_best_similarity(threads: list[str], model, theme_vecs, theme_names):
 
 def main():
     parser = argparse.ArgumentParser(description="Two-pass contemplative relevance filter")
-    parser.add_argument("--passages", default="passages_samples.jsonl",
+    parser.add_argument("--passages", default="passages_sample.jsonl",
                         help="Path to passages JSONL")
     parser.add_argument("--model", default="all-MiniLM-L6-v2",
                         help="Sentence transformer model name")
@@ -221,6 +280,24 @@ def main():
         print(f"Not found: {passages_path}")
         return
 
+    # ── Load existing corpus for incremental skip ─────────────────────
+    existing_ids = load_existing_ids()
+    if existing_ids:
+        print(f"Found {len(existing_ids)} passages already in {CORPUS_FILE}")
+
+    all_passages = load_passages(str(passages_path))
+    passages = [p for p in all_passages if p.get("passage_id") not in existing_ids]
+    skipped = len(all_passages) - len(passages)
+
+    if skipped:
+        print(f"Skipping {skipped} already-filtered passages")
+    if not passages:
+        print("All passages already filtered. Nothing to do.")
+        return
+
+    print(f"{len(passages)} passages to filter")
+
+    # ── Setup ─────────────────────────────────────────────────────────
     print(f"Loading embedding model: {args.model}")
     emb_model = SentenceTransformer(args.model)
 
@@ -229,8 +306,6 @@ def main():
     print(f"Embedding {len(theme_names)} theme glosses...")
     theme_vecs = emb_model.encode(theme_texts, normalize_embeddings=True)
 
-    passages = load_passages(str(passages_path))
-    print(f"Loaded {len(passages)} passages")
     print(f"Thresholds: reject < {args.reject:.2f} | borderline | accept > {args.accept:.2f}\n")
 
     # ── Pass 1: Embedding ──────────────────────────────────────────────
@@ -260,33 +335,6 @@ def main():
     print(f"  Borderline ({args.reject:.2f}–{args.accept:.2f}): {len(borderline)}")
     print(f"  Accepted  (sim > {args.accept:.2f}): {len(accepted)}")
     print()
-
-    if rejected:
-        print("-" * 70)
-        print("REJECTED (embedding too low):")
-        for p in sorted(rejected, key=lambda x: x["_best_sim"]):
-            print(f"  {p['_best_sim']:.3f}  {p.get('passage_id','?'):16s} "
-                  f"{p.get('author','?')}: {p.get('title','?')[:50]}")
-        print()
-
-    if accepted:
-        print("-" * 70)
-        print("ACCEPTED (embedding high enough):")
-        for p in sorted(accepted, key=lambda x: -x["_best_sim"]):
-            print(f"  {p['_best_sim']:.3f}  {p.get('passage_id','?'):16s} "
-                  f"{p.get('author','?')}: {p.get('title','?')[:50]}")
-        print()
-
-    if borderline:
-        print("-" * 70)
-        print("BORDERLINE (needs LLM judgment):")
-        for p in sorted(borderline, key=lambda x: x["_best_sim"]):
-            print(f"  {p['_best_sim']:.3f}  {p.get('passage_id','?'):16s} "
-                  f"{p.get('author','?')}: {p.get('title','?')[:50]}")
-            for thread, top3 in p["_thread_details"]:
-                print(f"           \"{thread[:80]}\"")
-                print(f"            → {', '.join(f'{t}={s:.3f}' for t, s in top3)}")
-        print()
 
     # ── Pass 2: LLM on borderline ─────────────────────────────────────
     llm_accepted = []
@@ -326,47 +374,35 @@ def main():
                 print(f"  {pid:16s} sim={p['_best_sim']:.3f}  LLM: {tag} ({conf})")
                 print(f"                   {reason}")
 
-    # ── Summary ────────────────────────────────────────────────────────
+    # ── Write accepted passages to run file ───────────────────────────
+    all_kept = accepted + llm_accepted
+    all_dropped = rejected + llm_rejected
+
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_file = RUNS_DIR / f"{timestamp}.jsonl"
+
+    with open(run_file, "w") as f:
+        for p in all_kept:
+            f.write(json.dumps(clean_record(p)) + "\n")
+
     print()
     print("=" * 70)
-    print("FINAL SUMMARY")
-    print(f"  Accepted by embedding:   {len(accepted)}")
-    print(f"  Accepted by LLM:         {len(llm_accepted)}")
-    print(f"  Rejected by embedding:   {len(rejected)}")
-    print(f"  Rejected by LLM:         {len(llm_rejected)}")
+    print("RESULTS")
+    print(f"  Accepted (embedding):    {len(accepted)}")
+    print(f"  Accepted (LLM):          {len(llm_accepted)}")
+    print(f"  Rejected (embedding):    {len(rejected)}")
+    print(f"  Rejected (LLM):          {len(llm_rejected)}")
     if llm_failed:
         print(f"  LLM failures:            {len(llm_failed)}")
     print(f"  ─────────────────────────────")
-    print(f"  Total kept:              {len(accepted) + len(llm_accepted)}")
-    print(f"  Total filtered:          {len(rejected) + len(llm_rejected)}")
-    
-    # ── Final List ────────────────────────────────────────────────────
-    print()
-    print("=" * 70)
-    print("FINAL LIST: AUTHOR, TITLE, DECISION")
-    print()
-    
-    # Combine all kept passages
-    all_kept = accepted + llm_accepted
-    # Combine all dropped passages
-    all_dropped = rejected + llm_rejected
-    
-    # Sort by author, then title
-    def sort_key(p):
-        return (p.get("author", "?"), p.get("title", "?"))
-    
-    print("KEPT:")
-    for p in sorted(all_kept, key=sort_key):
-        author = p.get("author", "?")
-        title = p.get("title", "?")
-        print(f"  {author}: {title}")
-    
-    print()
-    print("DROPPED:")
-    for p in sorted(all_dropped, key=sort_key):
-        author = p.get("author", "?")
-        title = p.get("title", "?")
-        print(f"  {author}: {title}")
+    print(f"  Total kept:              {len(all_kept)}")
+    print(f"  Total filtered:          {len(all_dropped)}")
+    print(f"  Run file:                {run_file}")
+
+    # ── Rebuild merged corpus ─────────────────────────────────────────
+    total = rebuild_corpus()
+    print(f"  Corpus total:            {total} passages in {CORPUS_FILE}")
 
 
 if __name__ == "__main__":

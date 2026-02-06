@@ -123,14 +123,15 @@ python passage_identification.py \
 - `text` — the extracted passage text
 - `text_words` — word count
 
-### Stage 4: Theme Filtering — `theme_test.py`
+### Stage 4: Filter Passages — `filter_passages.py`
 
-Two-pass quality filter on extracted passages.
+Two-pass quality filter on extracted passages. Produces the final filtered
+corpus ready for ingest by the web app.
 
 ```
-python theme_test.py --passages passages_sample.jsonl
-python theme_test.py --passages passages_sample.jsonl --reject 0.35 --accept 0.55
-python theme_test.py --passages passages_sample.jsonl --no-llm
+python filter_passages.py --passages passages_sample.jsonl
+python filter_passages.py --passages passages_sample.jsonl --reject 0.35 --accept 0.55
+python filter_passages.py --passages passages_sample.jsonl --no-llm
 ```
 
 **Pass 1 — Embedding distance (cheap, deterministic):**
@@ -144,10 +145,13 @@ python theme_test.py --passages passages_sample.jsonl --no-llm
 - Sends the full passage text to the LLM for a yes/no contemplative relevance call
 - Returns `relevant: true/false` with `confidence` and `reason`
 
-**Output:**
-- Prints rejected, accepted, and borderline lists with similarity scores
-- Final summary with counts
-- Final list of all passages sorted by author/title with KEEP/DROP decision
+**Incremental output:**
+- Reads `filtered_passages/corpus.jsonl` (if it exists) to build a set of
+  already-filtered `passage_id`s; those passages are skipped
+- Each run writes accepted passages to a timestamped file under
+  `filtered_passages/runs/` (e.g. `20260206T143000Z.jsonl`)
+- After the run, rebuilds `filtered_passages/corpus.jsonl` by merging and
+  deduplicating all run files — this is the single file the web app reads
 
 ## Dependencies
 
