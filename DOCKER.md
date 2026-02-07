@@ -9,6 +9,25 @@ This guide explains how to build and run the Ramana API server using Docker.
 
 ## Quick Start
 
+### Option 1: Pull Pre-built Image from GitHub Container Registry
+
+If the image has been built and pushed to GitHub Container Registry:
+
+```bash
+# Pull the image (replace OWNER/REPO with your GitHub username/repo)
+docker pull ghcr.io/OWNER/REPO/ramana_api:latest
+
+# Run the container
+docker run -d \
+  --name ramana-api \
+  -p 5001:5001 \
+  -e OPENROUTER_API_KEY="your-api-key-here" \
+  -v $(pwd)/sessions:/app/sessions \
+  ghcr.io/OWNER/REPO/ramana_api:latest
+```
+
+### Option 2: Build Locally
+
 1. **Build the Docker image:**
    ```bash
    docker build -t ramana-api .
@@ -24,10 +43,10 @@ This guide explains how to build and run the Ramana API server using Docker.
      ramana-api
    ```
 
-   The container defaults to:
-   - Model: `qwen/qwen3-vl-235b-a22b-instruct`
-   - Port: `5001`
-   - Backend: `openrouter`
+The container defaults to:
+- Model: `qwen/qwen3-vl-235b-a22b-instruct`
+- Port: `5001`
+- Backend: `openrouter`
 
 3. **Access the website:**
    Open http://localhost:5001 in your browser.
@@ -87,9 +106,12 @@ docker restart ramana-api
 
 ## Production Considerations
 
-1. **Environment Variables**: Set `OPENROUTER_API_KEY` via your cloud provider's secrets management (environment variables).
+1. **HTTPS/SSL**: The container serves HTTP only. For HTTPS in production:
+   - **Recommended**: Use your cloud provider's load balancer or a reverse proxy (nginx, Caddy, Traefik) to handle SSL/TLS termination
+   - The container runs on HTTP internally (port 5001), and the proxy forwards HTTPS traffic to it
+   - This is the standard production pattern and avoids managing certificates in the container
 
-2. **Reverse Proxy**: Use nginx or another reverse proxy in front of the container for SSL/TLS termination.
+2. **Environment Variables**: Set `OPENROUTER_API_KEY` via your cloud provider's secrets management (environment variables).
 
 3. **Session Persistence**: The `sessions/` volume ensures conversation history persists. Consider backing this up or using a database for production.
 
