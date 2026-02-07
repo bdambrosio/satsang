@@ -50,7 +50,7 @@ BAD thread: "The user asks about meditation and the response discusses self-inqu
 
 Focus on the experiential and contemplative substance -- what territory of awareness, identity, mind, or realization is being pointed at? NOT the surface topic, rhetorical structure, or conversation mechanics.
 
-DIALOGUE:
+{user_context_section}DIALOGUE:
 Question: {user_input}
 
 Response: {response}
@@ -212,6 +212,7 @@ class FilteredPassagesRAG:
         user_input: str,
         response: str,
         expanded_response: str = "",
+        user_context: str = "",
     ) -> list[str]:
         """
         Rewrite a user dialogue into semantic threads via LLM call.
@@ -224,6 +225,7 @@ class FilteredPassagesRAG:
             user_input: The user's question
             response: The generated response
             expanded_response: The expanded response (may be empty)
+            user_context: User model threads + recent turns (may be empty)
         
         Returns:
             List of 1-3 semantic thread strings
@@ -232,10 +234,15 @@ class FilteredPassagesRAG:
         if expanded_response:
             expanded_section = f"Expanded Response: {expanded_response}"
         
+        user_context_section = ""
+        if user_context:
+            user_context_section = f"VISITOR CONTEXT:\n{user_context}\n\n"
+        
         prompt = SEMANTIC_THREAD_REWRITE_PROMPT.format(
             user_input=user_input,
             response=response,
             expanded_section=expanded_section,
+            user_context_section=user_context_section,
         )
         
         try:
@@ -293,6 +300,7 @@ class FilteredPassagesRAG:
         user_input: str,
         response: str,
         expanded_response: str = "",
+        user_context: str = "",
         top_k: int = 5,
     ) -> list[dict]:
         """
@@ -306,12 +314,15 @@ class FilteredPassagesRAG:
             user_input: The user's question
             response: The generated response
             expanded_response: The expanded response (may be empty)
+            user_context: User model threads + recent turns (may be empty)
             top_k: Number of passages to return
         
         Returns:
             List of passage dicts with metadata, sorted by relevance
         """
-        threads = self.rewrite_query_as_threads(user_input, response, expanded_response)
+        threads = self.rewrite_query_as_threads(
+            user_input, response, expanded_response, user_context,
+        )
         return self.retrieve(threads, top_k=top_k)
     
     def retrieve(self, query_texts: str | list[str], top_k: int = 5) -> list[dict]:

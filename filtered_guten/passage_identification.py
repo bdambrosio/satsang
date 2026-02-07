@@ -11,6 +11,7 @@ import sys
 import time
 import argparse
 import requests
+from datetime import datetime, timezone
 from pathlib import Path
 
 VLLM_BASE = "http://0.0.0.0:5000/v1"
@@ -309,6 +310,59 @@ def validate_passage(p: dict) -> list[str]:
     return warnings
 
 
+VALID_CATEGORIES = ("essays", "religion", "philosophy", "poetry", "other", "nature")
+
+# ── Output paths ───────────────────────────────────────────────────────
+PASSAGES_DIR = Path("filtered_guten/passages")
+RUNS_DIR = PASSAGES_DIR / "runs"
+CORPUS_FILE = PASSAGES_DIR / "corpus.jsonl"
+
+
+def load_existing_doc_ids() -> set[str]:
+    """Load doc_ids already present in passages/corpus.jsonl."""
+    ids = set()
+    if CORPUS_FILE.exists():
+        with open(CORPUS_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    doc_id = rec.get("doc_id")
+                    if doc_id:
+                        ids.add(doc_id)
+                except json.JSONDecodeError:
+                    continue
+    return ids
+
+
+def rebuild_corpus():
+    """Rebuild corpus.jsonl by merging all run files, deduplicating by passage_id."""
+    seen = set()
+    records = []
+    if not RUNS_DIR.exists():
+        return 0
+    for run_file in sorted(RUNS_DIR.glob("*.jsonl")):
+        with open(run_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pid = rec.get("passage_id")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    records.append(line)
+    with open(CORPUS_FILE, "w") as f:
+        for line in records:
+            f.write(line + "\n")
+    return len(records)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract contemplative passages")
     parser.add_argument(
@@ -320,8 +374,8 @@ def main():
         help="Base directory containing corpus text files",
     )
     parser.add_argument(
-        "--output", default="passages.jsonl",
-        help="Output JSONL file",
+        "--category", default=None, choices=VALID_CATEGORIES,
+        help="Process only texts from this category (essays, religion, philosophy, poetry, other, nature)",
     )
     parser.add_argument(
         "--retries", type=int, default=2,
@@ -358,24 +412,50 @@ def main():
         print("No entries qualify. Check annotations file.")
         sys.exit(1)
 
+    # Filter by category if specified
+    if args.category:
+        prefix = args.category + "/"
+        entries = [e for e in entries if e.get("path", "").startswith(prefix)]
+        print(f"Filtered to category '{args.category}': {len(entries)} entries")
+        if not entries:
+            print(f"No entries in category '{args.category}'.")
+            sys.exit(1)
+
+    # Skip texts already in corpus.jsonl
+    existing_doc_ids = load_existing_doc_ids()
+    if existing_doc_ids:
+        before = len(entries)
+        entries = [e for e in entries if e.get("id") not in existing_doc_ids]
+        skipped = before - len(entries)
+        print(f"Skipping {skipped} texts already in {CORPUS_FILE} "
+              f"({len(existing_doc_ids)} doc_ids in corpus)")
+        if not entries:
+            print("All texts already processed. Nothing to do.")
+            sys.exit(0)
+
     if args.max_texts:
         entries = entries[:args.max_texts]
         print(f"Limited to {len(entries)} texts for testing")
+
+    print(f"\nTexts to process: {len(entries)}")
 
     # Connect
     model_name = get_model_name()
 
     corpus_dir = Path(args.corpus_dir)
-    output_path = Path(args.output)
+
+    # Prepare output: timestamped run file
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_file = RUNS_DIR / f"{timestamp}.jsonl"
+    print(f"Run output: {run_file}")
 
     total_passages = 0
     total_warnings = 0
     total_windows = 0
 
-    for doc_idx, entry in enumerate(entries):
-        # Open file: write mode for first doc, append mode for subsequent docs
-        mode = "w" if doc_idx == 0 else "a"
-        with open(output_path, mode) as out:
+    with open(run_file, "w") as out:
+        for doc_idx, entry in enumerate(entries):
             doc_id = entry.get("id", "?")
             doc_path = entry.get("path", "")
             title = entry.get("title", "?")[:60]
@@ -485,16 +565,19 @@ def main():
                 total_passages += 1
 
             print(f"  → {len(doc_passages)} passages extracted (after dedup)")
-        
-        # File closes here after each document is processed
+
+    # Rebuild merged corpus from all run files
+    corpus_total = rebuild_corpus()
 
     # Summary
     print("\n" + "=" * 60)
-    print(f"Done. Output: {output_path}")
+    print(f"Done.")
+    print(f"Run file: {run_file}")
     print(f"Texts processed: {len(entries)}")
     print(f"Windows processed: {total_windows}")
-    print(f"Passages extracted: {total_passages}")
+    print(f"Passages extracted (this run): {total_passages}")
     print(f"Passages with warnings: {total_warnings}")
+    print(f"Corpus total: {corpus_total} passages in {CORPUS_FILE}")
 
 
 if __name__ == "__main__":

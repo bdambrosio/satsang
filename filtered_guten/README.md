@@ -14,8 +14,8 @@ Mahayana, Zen, Tibetan), Hindu devotional and yoga literature, Sufism,
 Christian mysticism, Taoism, Stoicism, Neoplatonism, Transcendentalism, and
 others.
 
-Texts are organized into category subdirectories (e.g. `buddhist/`,
-`hindu-devotional/`, `stoic/`, `other/`) and catalogued in `manifest.json`.
+Texts are organized into category subdirectories (`essays/`, `religion/`,
+`philosophy/`, `poetry/`, `nature/`, `other/`) and catalogued in `manifest.json`.
 
 ### Sample manifest entry
 
@@ -43,6 +43,21 @@ Fields:
 > **Note:** The manifest, text files, and category subdirectories are not
 > committed to git (see `.gitignore`). Only the pipeline scripts and this
 > README are tracked.
+
+## Directory structure
+
+The pipeline produces two main output directories:
+
+- **`passages/`** — Output from Stage 3 (passage identification)
+  - `corpus.jsonl` — Merged corpus of all extracted passages
+  - `runs/` — Timestamped run files (e.g. `20260206T143000Z.jsonl`)
+
+- **`filtered_passages/`** — Output from Stage 4 (filtering)
+  - `corpus.jsonl` — Final filtered corpus (used by the web app)
+  - `runs/` — Timestamped run files (e.g. `20260206T143000Z.jsonl`)
+
+Both directories support incremental runs: each stage skips work already present
+in its `corpus.jsonl` file, allowing safe re-runs and incremental processing.
 
 ## Processing pipeline
 
@@ -93,14 +108,22 @@ Extracts self-contained contemplative passages from qualified texts.
 
 ```
 python passage_identification.py \
-  --annotations annotations_sample.jsonl \
+  --annotations filtered_guten/annotations-full.jsonl \
   --corpus-dir filtered_guten \
-  --output passages_sample.jsonl \
-  --max-passages-per-doc 30
+  --max-passages-per-doc 25
+
+# Process only a specific category
+python passage_identification.py \
+  --annotations filtered_guten/annotations-full.jsonl \
+  --corpus-dir filtered_guten \
+  --category religion \
+  --max-passages-per-doc 25
 ```
 
 **What it does:**
 - Filters annotations to `core`/`useful` relevance + `high`/`medium` confidence
+- Optionally filters by `--category` (essays, religion, philosophy, poetry, other, nature)
+- Skips `doc_id`s already present in `passages/corpus.jsonl` (incremental runs)
 - For each qualifying text, loads the full plain-text file
 - Slides overlapping windows (default 6000 tokens, 1500 overlap) through the text
 - Sends each window to the LLM with document metadata and asks it to identify
@@ -109,6 +132,10 @@ python passage_identification.py \
   telling the LLM to be more selective (`--max-passages-per-doc`)
 - Resolves extracted line ranges back to actual text
 - Deduplicates overlapping passages across window boundaries
+
+**Output structure:**
+- Each run writes to a timestamped file: `passages/runs/YYYYMMDDTHHMMSSZ.jsonl`
+- After each run, rebuilds `passages/corpus.jsonl` by merging all run files
 - Output is flushed after each document (crash-safe)
 
 **Output fields per passage:**
@@ -129,10 +156,22 @@ Two-pass quality filter on extracted passages. Produces the final filtered
 corpus ready for ingest by the web app.
 
 ```
-python filter_passages.py --passages passages_sample.jsonl
-python filter_passages.py --passages passages_sample.jsonl --reject 0.35 --accept 0.55
-python filter_passages.py --passages passages_sample.jsonl --no-llm
+# Uses passages/corpus.jsonl as input by default
+python filter_passages.py
+
+# Customize thresholds
+python filter_passages.py --reject 0.35 --accept 0.55
+
+# Skip LLM pass (embedding-only)
+python filter_passages.py --no-llm
+
+# Override input file
+python filter_passages.py --passages custom_input.jsonl
 ```
+
+**Input:**
+- Default: reads from `passages/corpus.jsonl` (output from Stage 3)
+- Can override with `--passages` to process a different file
 
 **Pass 1 — Embedding distance (cheap, deterministic):**
 - Encodes each passage's `semantic_threads` with a sentence transformer
@@ -180,11 +219,12 @@ and theme filtering:
 
 - **Scale annotation**: Current runs sample a subset (`--n`). Full corpus
   annotation requires multiple runs or increasing `--n` to cover all entries.
-- **Tune thresholds**: The embedding reject/accept thresholds in `theme_test.py`
+- **Tune thresholds**: The embedding reject/accept thresholds in `filter_passages.py`
   and the `--max-passages-per-doc` value may need adjustment as more data flows
   through the pipeline.
-- **Integration**: Accepted passages need to be loaded into the main satsang
-  retrieval system (FAISS index in `contemplative_rag.py`) as sidebar resonances.
+- **Integration**: Accepted passages are loaded into the retrieval system via
+  `FilteredPassagesRAG` (see `src/filtered_passages_rag.py`), which builds a FAISS
+  index from `semantic_threads` for sidebar passage retrieval.
 - **Human review**: Low-confidence annotations and borderline LLM judgments
   should be spot-checked.
 - **Deduplication across documents**: Some passages (e.g. the same Upanishad

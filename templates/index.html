@@ -44,14 +44,15 @@
                 <section class="expanded-response-section" id="expanded-response-section" style="display: none;">
                     <h2>Expanded Response</h2>
                     <div id="expanded-response-text" class="expanded-response-text"></div>
+                    <div id="expand-loading" class="loading-message" style="display: none;">Expanding...</div>
                 </section>
             </main>
 
             <!-- Sidebar -->
             <aside class="sidebar">
-                <h2>Related Passages</h2>
+                <h2>Related Passage</h2>
                 <div id="passages-list" class="passages-list">
-                    <p class="empty-message">Submit a question to see related passages.</p>
+                    <p class="empty-message">Submit a question to see a related passage.</p>
                 </div>
             </aside>
         </div>
@@ -78,7 +79,7 @@
             }
         }
 
-        // Handle form submission
+        // Handle form submission — progressive flow
         document.getElementById('query-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             
@@ -86,101 +87,123 @@
             const submitBtn = document.getElementById('submit-btn');
             const query = queryInput.value.trim();
             
-            if (!query) {
-                return;
-            }
+            if (!query) return;
             
-            // Disable form during request
+            // Disable form
             submitBtn.disabled = true;
             submitBtn.textContent = 'Processing...';
             
-            // Clear previous responses
+            // Clear previous
             document.getElementById('response-section').style.display = 'none';
             document.getElementById('expanded-response-section').style.display = 'none';
+            document.getElementById('expand-loading').style.display = 'none';
             document.getElementById('passages-list').innerHTML = 
-                '<p class="loading-message">Loading...</p>';
+                '<p class="empty-message">Waiting for response...</p>';
             
             try {
-                // Generate response
-                const response = await fetch('/api/query', {
+                // Step 1: Get initial response (blocks until ready)
+                const queryResponse = await fetch('/api/query', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ query: query }),
                 });
+                const queryData = await queryResponse.json();
                 
-                const data = await response.json();
+                if (queryData.error) throw new Error(queryData.error);
                 
-                if (data.error) {
-                    throw new Error(data.error);
-                }
-                
-                // Display response
-                if (data.is_silence) {
+                // Display response immediately
+                if (queryData.is_silence) {
                     document.getElementById('response-text').textContent = 
-                        data.message || 'Silence is sometimes the most appropriate response.';
+                        queryData.message || 'Silence is sometimes the most appropriate response.';
                     document.getElementById('response-section').style.display = 'block';
-                } else {
-                    if (data.response) {
-                        document.getElementById('response-text').textContent = data.response;
-                        document.getElementById('response-section').style.display = 'block';
-                    }
-                    
-                    if (data.expanded_response) {
-                        document.getElementById('expanded-response-text').textContent = data.expanded_response;
-                        document.getElementById('expanded-response-section').style.display = 'block';
-                    }
+                    // Re-enable form — nothing more to do
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Submit';
+                    document.getElementById('passages-list').innerHTML = 
+                        '<p class="empty-message"></p>';
+                    return;
                 }
                 
-                // Retrieve passages
-                await retrievePassages(query, data.response || '', data.expanded_response || '');
+                const responseText = queryData.response || '';
+                if (responseText) {
+                    document.getElementById('response-text').textContent = responseText;
+                    document.getElementById('response-section').style.display = 'block';
+                }
+                
+                // Re-enable form immediately — expand and passages load in background
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Submit';
+                
+                // Step 2: Expand (non-blocking — show loading indicator)
+                document.getElementById('expanded-response-section').style.display = 'block';
+                document.getElementById('expand-loading').style.display = 'block';
+                document.getElementById('expanded-response-text').textContent = '';
+                
+                // Step 3: Kick off expand and use its result for passages
+                fetchExpandThenPassages(query, responseText);
                 
             } catch (error) {
                 console.error('Error:', error);
                 document.getElementById('passages-list').innerHTML = 
                     '<p class="error-message">Error: ' + error.message + '</p>';
-            } finally {
-                // Re-enable form
                 submitBtn.disabled = false;
                 submitBtn.textContent = 'Submit';
             }
         });
         
-        // Retrieve passages for sidebar
-        async function retrievePassages(userInput, response, expandedResponse) {
+        // Fetch expand, then use result to fetch passages
+        async function fetchExpandThenPassages(query, responseText) {
+            let expandedText = '';
+            
+            // Fetch expand
             try {
-                const fetchResponse = await fetch('/api/retrieve-passages', {
+                const expandResponse = await fetch('/api/expand', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: query, response: responseText }),
+                });
+                const expandData = await expandResponse.json();
+                
+                document.getElementById('expand-loading').style.display = 'none';
+                
+                if (expandData.expanded_response) {
+                    expandedText = expandData.expanded_response;
+                    document.getElementById('expanded-response-text').textContent = expandedText;
+                } else {
+                    // No expanded response — hide the section
+                    document.getElementById('expanded-response-section').style.display = 'none';
+                }
+            } catch (error) {
+                console.error('Error expanding:', error);
+                document.getElementById('expand-loading').style.display = 'none';
+                document.getElementById('expanded-response-section').style.display = 'none';
+            }
+            
+            // Fetch passages (uses expand result)
+            document.getElementById('passages-list').innerHTML = 
+                '<p class="loading-message">Finding related passage...</p>';
+            
+            try {
+                const passagesResponse = await fetch('/api/retrieve-passages', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        user_input: userInput,
-                        response: response,
-                        expanded_response: expandedResponse,
-                        top_k: 5,
+                        user_input: query,
+                        response: responseText,
+                        expanded_response: expandedText,
                     }),
                 });
+                const passagesData = await passagesResponse.json();
                 
-                const data = await fetchResponse.json();
-                
-                if (data.error) {
-                    console.error('Retrieval error:', data.error);
-                    document.getElementById('passages-list').innerHTML = 
-                        '<p class="error-message">Error retrieving passages.</p>';
-                    return;
-                }
-                
-                const passages = data.passages || [];
+                const passages = passagesData.passages || [];
                 
                 if (passages.length === 0) {
                     document.getElementById('passages-list').innerHTML = 
-                        '<p class="empty-message">No related passages found.</p>';
+                        '<p class="empty-message"></p>';
                     return;
                 }
                 
-                // Display passages
+                // Display passage(s)
                 let html = '';
                 passages.forEach((passage) => {
                     html += `
@@ -200,7 +223,7 @@
             } catch (error) {
                 console.error('Error retrieving passages:', error);
                 document.getElementById('passages-list').innerHTML = 
-                    '<p class="error-message">Error retrieving passages.</p>';
+                    '<p class="empty-message"></p>';
             }
         }
         

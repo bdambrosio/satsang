@@ -10,14 +10,18 @@ Pass 2: LLM judgment — full passage text sent for borderline cases.
   Everything between the two thresholds gets a yes/no call with the
   actual passage text, not just the thread descriptions.
 
-Incremental: reads any existing corpus.jsonl to skip already-filtered
+Incremental: reads any existing filtered_passages/corpus.jsonl to skip already-filtered
 passages.  Each run writes a timestamped file under filtered_passages/runs/,
 then rebuilds the merged filtered_passages/corpus.jsonl from all run files.
 
+Input: reads from filtered_guten/passages/corpus.jsonl by default (output from passage_identification.py).
+Output: writes to filtered_guten/filtered_passages/runs/ and rebuilds filtered_guten/filtered_passages/corpus.jsonl.
+
 Usage:
-  python filter_passages.py --passages passages_sample.jsonl
-  python filter_passages.py --passages passages_sample.jsonl --reject 0.35 --accept 0.55
-  python filter_passages.py --passages passages_sample.jsonl --no-llm
+  python filter_passages.py
+  python filter_passages.py --reject 0.35 --accept 0.55
+  python filter_passages.py --no-llm
+  python filter_passages.py --passages custom_input.jsonl  # override default input
 """
 
 import json
@@ -34,8 +38,9 @@ VLLM_BASE = "http://0.0.0.0:5000/v1"
 DEFAULT_REJECT = 0.35
 DEFAULT_ACCEPT = 0.55
 
-# ── Output paths ───────────────────────────────────────────────────────
-OUTPUT_DIR = Path("filtered_passages")
+# ── Input/Output paths ───────────────────────────────────────────────────────
+PASSAGES_INPUT = Path("filtered_guten/passages/corpus.jsonl")
+OUTPUT_DIR = Path("filtered_guten/filtered_passages")
 RUNS_DIR = OUTPUT_DIR / "runs"
 CORPUS_FILE = OUTPUT_DIR / "corpus.jsonl"
 
@@ -263,8 +268,8 @@ def compute_best_similarity(threads: list[str], model, theme_vecs, theme_names):
 
 def main():
     parser = argparse.ArgumentParser(description="Two-pass contemplative relevance filter")
-    parser.add_argument("--passages", default="passages_sample.jsonl",
-                        help="Path to passages JSONL")
+    parser.add_argument("--passages", default=str(PASSAGES_INPUT),
+                        help=f"Path to passages JSONL (default: {PASSAGES_INPUT})")
     parser.add_argument("--model", default="all-MiniLM-L6-v2",
                         help="Sentence transformer model name")
     parser.add_argument("--reject", type=float, default=DEFAULT_REJECT,
@@ -277,7 +282,8 @@ def main():
 
     passages_path = Path(args.passages)
     if not passages_path.exists():
-        print(f"Not found: {passages_path}")
+        print(f"Input file not found: {passages_path}")
+        print(f"Run passage_identification.py first to generate {PASSAGES_INPUT}")
         return
 
     # ── Load existing corpus for incremental skip ─────────────────────
@@ -286,6 +292,8 @@ def main():
         print(f"Found {len(existing_ids)} passages already in {CORPUS_FILE}")
 
     all_passages = load_passages(str(passages_path))
+    print(f"Loaded {len(all_passages)} passages from {passages_path}")
+    
     passages = [p for p in all_passages if p.get("passage_id") not in existing_ids]
     skipped = len(all_passages) - len(passages)
 
