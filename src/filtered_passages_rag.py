@@ -86,20 +86,28 @@ class FilteredPassagesRAG:
             corpus_path: Path to corpus.jsonl file
             embedding_model: Sentence transformer model name
             llm_url: URL for the LLM API (used for query rewriting)
-            llm_model: Model name for LLM (auto-detected if None)
+            llm_model: Model name for LLM (auto-detected if None for local, required for OpenRouter)
         """
         self.corpus_path = Path(corpus_path)
         self.embedding_model = embedding_model
         self.llm_url = llm_url
         self.llm_model = llm_model
         
+        # Detect backend from URL
+        self.llm_backend = "openrouter" if "openrouter.ai" in llm_url else "local"
+        
         # HTTP client for LLM calls
         self.http_client = httpx.Client(timeout=60.0)
         
-        # Auto-detect LLM model if not provided
+        # Auto-detect LLM model if not provided (local only)
         if self.llm_model is None:
-            self.llm_model = self._detect_llm_model()
-            logger.info(f"Auto-detected LLM model: {self.llm_model}")
+            if self.llm_backend == "openrouter":
+                # Default for OpenRouter
+                self.llm_model = "anthropic/claude-sonnet-4"
+                logger.info(f"Using default OpenRouter model: {self.llm_model}")
+            else:
+                self.llm_model = self._detect_llm_model()
+                logger.info(f"Auto-detected LLM model: {self.llm_model}")
         
         # Load embedding model
         logger.info(f"Loading embedding model: {embedding_model}")
@@ -246,16 +254,30 @@ class FilteredPassagesRAG:
         )
         
         try:
+            # Build request payload
+            payload = {
+                "model": self.llm_model,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 512,
+                "temperature": 0.3,
+            }
+            
+            # Build headers (OpenRouter needs auth)
+            headers = {}
+            if self.llm_backend == "openrouter":
+                api_key = os.environ.get("OPENROUTER_API_KEY")
+                if not api_key:
+                    raise ValueError("OPENROUTER_API_KEY environment variable required")
+                headers["Authorization"] = f"Bearer {api_key}"
+                headers["HTTP-Referer"] = "https://github.com/ramana-website"
+                headers["X-Title"] = "Ramana Website"
+            
             resp = self.http_client.post(
                 f"{self.llm_url}/chat/completions",
-                json={
-                    "model": self.llm_model,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ],
-                    "max_tokens": 512,
-                    "temperature": 0.3,
-                }
+                json=payload,
+                headers=headers,
             )
             resp.raise_for_status()
             raw = resp.json()["choices"][0]["message"]["content"].strip()
@@ -269,7 +291,32 @@ class FilteredPassagesRAG:
                 cleaned = re.sub(r'\n?```$', '', cleaned)
                 cleaned = cleaned.strip()
             
-            threads = json.loads(cleaned)
+            # LLM sometimes returns multiple JSON arrays on separate lines
+            # e.g. ["thread1"]\n["thread2"]\n["thread3"]
+            # Try direct parse first; on failure, merge separate arrays
+            try:
+                threads = json.loads(cleaned)
+            except json.JSONDecodeError:
+                merged = []
+                for line in cleaned.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                        if isinstance(parsed, list):
+                            merged.extend(parsed)
+                        elif isinstance(parsed, str):
+                            merged.append(parsed)
+                    except json.JSONDecodeError:
+                        # Bare string line — use as-is
+                        if line.strip('"').strip("'"):
+                            merged.append(line.strip('"').strip("'"))
+                if merged:
+                    logger.info(f"Merged {len(merged)} threads from multi-line LLM output")
+                    threads = merged
+                else:
+                    raise
             
             if not isinstance(threads, list):
                 logger.warning(f"LLM returned non-list: {type(threads)}")

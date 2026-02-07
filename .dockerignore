@@ -1,0 +1,71 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+
+# Data processing scripts (not needed at runtime)
+filtered_guten/passage_identification.py
+filtered_guten/filter_passages.py
+filtered_guten/annotate.py
+filtered_guten/stats.py
+filtered_guten/README.md
+filtered_guten/passages/
+filtered_guten/filtered_passages/runs/
+
+# Source files not needed at runtime
+src/continued_pretrain.py
+src/continued-pretrain-lora.py
+src/diagnose-lora-checkpoint.py
+src/filter_spgc_corpus.py
+src/format_prompt.py
+src/inference_patch.py
+src/jsonl_reviewer.py
+src/parse-talks.py
+src/pdf-to-text.py
+src/phi2-contemplative-inference-lora.py
+src/sft_training.py
+
+# Training data and annotations
+annotations.jsonl
+annotations_sample.jsonl
+annotations_sample.jsonl~
+eval_prompts.txt
+passages.jsonl
+theme_vocabulary_draft.md
+
+# Ramana data files not needed at runtime
+ramana/*.pdf
+ramana/*.txt#
+ramana/*.txt~
+ramana/Talks-*.jsonl
+ramana/Commentaries+by+Sri+Ramana+Maharshi*.txt
+ramana/Commentaries_qa_excert.txt~
+
+# Sessions (runtime data, mounted as volume)
+sessions/
+
+# Other
+LICENSE

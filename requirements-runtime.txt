@@ -1,0 +1,15 @@
+# Runtime dependencies for Ramana API Server
+# (No training dependencies needed)
+
+# Web framework
+Flask>=3.0.0
+
+# HTTP client for LLM API calls
+httpx>=0.25.0
+
+# Embeddings and vector search
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4
+
+# Numerical computing
+numpy>=1.17.0

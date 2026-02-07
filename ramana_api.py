@@ -11,8 +11,10 @@ Provides endpoints for:
 - Sidebar RAG retrieval with LLM post-filter
 """
 
+import argparse
 import json
 import logging
+import os
 import random
 import re
 import uuid
@@ -45,10 +47,15 @@ filtered_passages_rag = None
 llm_http = httpx.Client(timeout=60.0)
 llm_model_name = None
 
+# ── LLM Configuration (set from CLI/env) ──────────────────────────────
+
+llm_backend = "local"  # "local" or "openrouter"
+llm_url = "http://localhost:5000/v1"  # vLLM URL or OpenRouter URL
+llm_model = None  # Model name (required for OpenRouter, auto-detected for local)
+
 # ── Constants ─────────────────────────────────────────────────────────
 
 SESSIONS_DIR = Path(__file__).parent / "sessions"
-LLM_URL = "http://localhost:5000/v1"
 
 # Session cookie settings
 SESSION_COOKIE_NAME = "ramana_session"
@@ -87,7 +94,37 @@ Respond with ONLY a JSON object:
 {{
   "show": true or false,
   "confidence": <float 0.0 to 1.0>,
-  "reason": "<one sentence>"
+  "reason": "<terse, 6-10 words max>"
+}}
+
+No markdown, no preamble."""
+
+# Expand post-filter prompt
+EXPAND_FILTER_PROMPT = """You are reviewing an expanded response for a website devoted to Ramana Maharshi's teachings. The original response was a brief, direct pointing. The expanded version elaborates on it, drawing from Commentaries and related teachings.
+
+You must judge whether the expanded response:
+- FAITHFULLY elaborates on the original response without contradicting or distorting it
+- Remains COHERENT and accessible to the reader
+- Does NOT introduce confusing, misleading, or contradictory material
+- Adds genuine depth rather than diluting the original pointing
+
+DIALOGUE:
+Question: {user_input}
+{user_context_section}
+Original Response: {response}
+
+--- EXPANDED RESPONSE ---
+{expanded_response}
+--- END ---
+
+If the expanded response fails these criteria, provide a brief rewrite instruction explaining what's wrong and how to fix it.
+
+Respond with ONLY a JSON object:
+{{
+  "acceptable": true or false,
+  "confidence": <float 0.0 to 1.0>,
+  "reason": "<terse, 6-10 words max>",
+  "rewrite_instruction": "<brief instruction if not acceptable, else null>"
 }}
 
 No markdown, no preamble."""
@@ -309,14 +346,28 @@ def generate_session_rollup(session_id: str):
     )
     
     try:
+        # Build request payload
+        payload = {
+            "model": llm_model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 512,
+            "temperature": 0.3,
+        }
+        
+        # Build headers (OpenRouter needs auth)
+        headers = {}
+        if llm_backend == "openrouter":
+            api_key = os.environ.get("OPENROUTER_API_KEY")
+            if not api_key:
+                raise ValueError("OPENROUTER_API_KEY environment variable required")
+            headers["Authorization"] = f"Bearer {api_key}"
+            headers["HTTP-Referer"] = "https://github.com/ramana-website"
+            headers["X-Title"] = "Ramana Website"
+        
         resp = llm_http.post(
-            f"{LLM_URL}/chat/completions",
-            json={
-                "model": llm_model_name,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 512,
-                "temperature": 0.3,
-            }
+            f"{llm_url}/chat/completions",
+            json=payload,
+            headers=headers,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
@@ -404,14 +455,28 @@ def filter_passage_with_llm(
     )
     
     try:
+        # Build request payload
+        payload = {
+            "model": llm_model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 256,
+            "temperature": 0.1,
+        }
+        
+        # Build headers (OpenRouter needs auth)
+        headers = {}
+        if llm_backend == "openrouter":
+            api_key = os.environ.get("OPENROUTER_API_KEY")
+            if not api_key:
+                raise ValueError("OPENROUTER_API_KEY environment variable required")
+            headers["Authorization"] = f"Bearer {api_key}"
+            headers["HTTP-Referer"] = "https://github.com/ramana-website"
+            headers["X-Title"] = "Ramana Website"
+        
         resp = llm_http.post(
-            f"{LLM_URL}/chat/completions",
-            json={
-                "model": llm_model_name,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 256,
-                "temperature": 0.1,
-            }
+            f"{llm_url}/chat/completions",
+            json=payload,
+            headers=headers,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
@@ -436,21 +501,103 @@ def filter_passage_with_llm(
         return {"show": True, "confidence": 0.3, "reason": "filter unavailable"}
 
 
-def detect_llm_model():
-    """Auto-detect model from local vLLM API."""
-    global llm_model_name
+def filter_expand_with_llm(
+    user_input: str,
+    response: str,
+    expanded_response: str,
+    user_context: str = "",
+) -> dict:
+    """
+    Ask LLM whether an expanded response is coherent/faithful to the original.
+    
+    Returns:
+        {"acceptable": bool, "confidence": float, "reason": str,
+         "rewrite_instruction": str or None}
+    """
+    user_context_section = ""
+    if user_context:
+        user_context_section = f"Visitor context:\n{user_context}\n"
+    
+    prompt = EXPAND_FILTER_PROMPT.format(
+        user_input=user_input,
+        user_context_section=user_context_section,
+        response=response,
+        expanded_response=expanded_response,
+    )
+    
     try:
-        resp = llm_http.get(f"{LLM_URL}/models")
+        payload = {
+            "model": llm_model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 256,
+            "temperature": 0.1,
+        }
+        
+        headers = {}
+        if llm_backend == "openrouter":
+            api_key = os.environ.get("OPENROUTER_API_KEY")
+            if not api_key:
+                raise ValueError("OPENROUTER_API_KEY environment variable required")
+            headers["Authorization"] = f"Bearer {api_key}"
+            headers["HTTP-Referer"] = "https://github.com/ramana-website"
+            headers["X-Title"] = "Ramana Website"
+        
+        resp = llm_http.post(
+            f"{llm_url}/chat/completions",
+            json=payload,
+            headers=headers,
+        )
         resp.raise_for_status()
-        data = resp.json()
-        if "data" in data and len(data["data"]) > 0:
-            llm_model_name = data["data"][0]["id"]
-            logger.info(f"Auto-detected LLM model: {llm_model_name}")
-        else:
-            llm_model_name = "unknown"
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        
+        if raw.startswith("```"):
+            raw = re.sub(r'^```\w*\n?', '', raw)
+            raw = re.sub(r'\n?```$', '', raw)
+            raw = raw.strip()
+        
+        result = json.loads(raw)
+        
+        return {
+            "acceptable": bool(result.get("acceptable", False)),
+            "confidence": float(result.get("confidence", 0.0)),
+            "reason": str(result.get("reason", "")),
+            "rewrite_instruction": result.get("rewrite_instruction"),
+        }
+    
     except Exception as e:
-        logger.warning(f"Could not detect LLM model: {e}")
-        llm_model_name = "unknown"
+        logger.error(f"Expand filter LLM call failed: {e}")
+        # On failure, accept the expand
+        return {"acceptable": True, "confidence": 0.3, "reason": "filter unavailable",
+                "rewrite_instruction": None}
+
+
+def detect_llm_model():
+    """Auto-detect model from local vLLM API or use configured model."""
+    global llm_model_name
+    
+    if llm_backend == "openrouter":
+        # OpenRouter requires explicit model name
+        if llm_model:
+            llm_model_name = llm_model
+            logger.info(f"Using OpenRouter model: {llm_model_name}")
+        else:
+            # Default for OpenRouter
+            llm_model_name = "anthropic/claude-sonnet-4"
+            logger.info(f"Using default OpenRouter model: {llm_model_name}")
+    else:
+        # Local vLLM: try to auto-detect
+        try:
+            resp = llm_http.get(f"{llm_url}/models")
+            resp.raise_for_status()
+            data = resp.json()
+            if "data" in data and len(data["data"]) > 0:
+                llm_model_name = data["data"][0]["id"]
+                logger.info(f"Auto-detected LLM model: {llm_model_name}")
+            else:
+                llm_model_name = llm_model or "unknown"
+        except Exception as e:
+            logger.warning(f"Could not detect LLM model: {e}")
+            llm_model_name = llm_model or "unknown"
 
 
 # ── Initialization ────────────────────────────────────────────────────
@@ -536,21 +683,35 @@ def initialize_generator():
     global generator
     
     try:
+        # Determine critic model
+        critic_model = llm_model
+        if llm_backend == "openrouter" and not critic_model:
+            critic_model = "anthropic/claude-sonnet-4"
+        
         critic = LocalCritic(
-            backend="local",
-            base_url="http://localhost:5000/v1",
+            backend=llm_backend,
+            base_url=llm_url if llm_backend == "local" else None,
+            model=critic_model,
             threshold=6.0,
         )
+        
+        # Determine RAG model
+        rag_model = llm_model
+        if llm_backend == "openrouter" and not rag_model:
+            rag_model = "anthropic/claude-sonnet-4"
+        
         rag_provider = ContemplativeRAGProvider(
             commentaries_path="./ramana/Commentaries_qa_excert.txt",
-            backend="local",
-            local_url="http://localhost:5000/v1",
+            backend=llm_backend,
+            local_url=llm_url if llm_backend == "local" else None,
+            model=rag_model,
         )
+        
         generator = ContemplativeGenerator(
             inference_provider=rag_provider,
             critic=critic,
         )
-        logger.info("ContemplativeGenerator initialized successfully")
+        logger.info(f"ContemplativeGenerator initialized successfully (backend={llm_backend})")
     except Exception as e:
         logger.error(f"Failed to initialize generator: {e}")
         generator = None
@@ -576,9 +737,10 @@ def initialize_filtered_passages_rag():
     try:
         filtered_passages_rag = FilteredPassagesRAG(
             corpus_path=str(corpus_path),
-            llm_url="http://localhost:5000/v1",
+            llm_url=llm_url,
+            llm_model=llm_model,
         )
-        logger.info(f"FilteredPassagesRAG initialized successfully from {corpus_path}")
+        logger.info(f"FilteredPassagesRAG initialized successfully from {corpus_path} (backend={llm_backend})")
     except Exception as e:
         logger.error(f"Failed to initialize FilteredPassagesRAG: {e}")
         filtered_passages_rag = None
@@ -718,7 +880,10 @@ def handle_query():
 @app.route('/api/expand', methods=['POST'])
 def handle_expand():
     """
-    Generate expanded response. Called after /api/query returns.
+    Generate expanded response with post-filter.
+    
+    If the expanded response fails the coherence filter, retries once
+    with the filter's rewrite instruction. Returns blank if both fail.
     """
     if generator is None:
         return jsonify({'error': 'Generator not initialized'}), 500
@@ -733,12 +898,64 @@ def handle_expand():
     if not user_query or not response_text:
         return jsonify({'expanded_response': ''})
     
+    session_id = get_or_create_session_id()
+    user_context = get_user_context_for_prompt(session_id)
+    
+    MIN_CONFIDENCE = 0.5
+    
     try:
+        # First attempt
         expanded_response = generator.expand(user_query, response_text)
         if not expanded_response:
-            expanded_response = ''
+            return jsonify({'expanded_response': ''})
         
-        return jsonify({'expanded_response': expanded_response})
+        # Post-filter
+        verdict = filter_expand_with_llm(
+            user_input=user_query,
+            response=response_text,
+            expanded_response=expanded_response,
+            user_context=user_context,
+        )
+        logger.info(f"Expand filter: acceptable={verdict['acceptable']}, "
+                    f"confidence={verdict['confidence']:.2f}, "
+                    f"reason={verdict['reason']}")
+        
+        if verdict["acceptable"] and verdict["confidence"] >= MIN_CONFIDENCE:
+            return jsonify({'expanded_response': expanded_response})
+        
+        # Failed — retry once with rewrite instruction
+        rewrite_hint = verdict.get("rewrite_instruction") or verdict["reason"]
+        logger.info(f"Expand rejected, retrying with hint: {rewrite_hint}")
+        
+        # Augment the query with the rewrite instruction
+        augmented_query = (
+            f"{user_query}\n\n"
+            f"[Note: A previous expansion was rejected because: {rewrite_hint}. "
+            f"Please generate a new expansion that avoids this issue.]"
+        )
+        
+        expanded_response_2 = generator.expand(augmented_query, response_text)
+        if not expanded_response_2:
+            logger.info("Retry expand returned empty, returning blank")
+            return jsonify({'expanded_response': ''})
+        
+        # Post-filter the retry
+        verdict_2 = filter_expand_with_llm(
+            user_input=user_query,
+            response=response_text,
+            expanded_response=expanded_response_2,
+            user_context=user_context,
+        )
+        logger.info(f"Expand retry filter: acceptable={verdict_2['acceptable']}, "
+                    f"confidence={verdict_2['confidence']:.2f}, "
+                    f"reason={verdict_2['reason']}")
+        
+        if verdict_2["acceptable"] and verdict_2["confidence"] >= MIN_CONFIDENCE:
+            return jsonify({'expanded_response': expanded_response_2})
+        
+        # Both attempts failed — return blank
+        logger.info("Expand failed post-filter twice, returning blank")
+        return jsonify({'expanded_response': ''})
     
     except Exception as e:
         logger.error(f"Error expanding response: {e}", exc_info=True)
@@ -839,6 +1056,66 @@ def retrieve_passages():
 # ── Main ──────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Ramana Maharshi Website API Server")
+    parser.add_argument(
+        '--llm-backend',
+        type=str,
+        default=os.environ.get('LLM_BACKEND', 'local'),
+        choices=['local', 'openrouter'],
+        help='LLM backend: "local" (vLLM) or "openrouter" (default: local, or LLM_BACKEND env var)'
+    )
+    parser.add_argument(
+        '--llm-url',
+        type=str,
+        default=os.environ.get('LLM_URL', 'http://localhost:5000/v1'),
+        help='LLM API URL (default: http://localhost:5000/v1 for local, or LLM_URL env var)'
+    )
+    parser.add_argument(
+        '--llm-model',
+        type=str,
+        default=os.environ.get('LLM_MODEL', None),
+        help='LLM model name (required for OpenRouter, auto-detected for local, or LLM_MODEL env var)'
+    )
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=int(os.environ.get('PORT', '5001')),
+        help='Port to run Flask app on (default: 5001, or PORT env var)'
+    )
+    parser.add_argument(
+        '--host',
+        type=str,
+        default=os.environ.get('HOST', '0.0.0.0'),
+        help='Host to bind to (default: 0.0.0.0, or HOST env var)'
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        default=os.environ.get('FLASK_DEBUG', 'False').lower() == 'true',
+        help='Enable Flask debug mode (or FLASK_DEBUG=true env var)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Set module-level LLM configuration (no 'global' needed at module scope)
+    llm_backend = args.llm_backend
+    llm_url = args.llm_url
+    llm_model = args.llm_model
+    
+    # Auto-set OpenRouter URL if backend is openrouter and URL is still default
+    if llm_backend == 'openrouter' and llm_url == 'http://localhost:5000/v1':
+        llm_url = 'https://openrouter.ai/api/v1'
+        logger.info(f"Auto-set LLM URL to OpenRouter: {llm_url}")
+    
+    # Validate OpenRouter configuration
+    if llm_backend == 'openrouter':
+        if not os.environ.get('OPENROUTER_API_KEY'):
+            logger.warning("OPENROUTER_API_KEY not set - OpenRouter calls will fail")
+        if not llm_model:
+            logger.info("No model specified for OpenRouter, will use default: anthropic/claude-sonnet-4")
+    
+    logger.info(f"LLM Configuration: backend={llm_backend}, url={llm_url}, model={llm_model or 'auto'}")
+    
     logger.info("Initializing Ramana API server...")
     load_nan_yar_passages()
     initialize_generator()
@@ -851,4 +1128,4 @@ if __name__ == '__main__':
     # Disable reloader under debugpy to avoid SystemExit(3) conflict
     import sys
     under_debugger = "debugpy" in sys.modules
-    app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=not under_debugger)
+    app.run(host=args.host, port=args.port, debug=args.debug, use_reloader=not under_debugger and args.debug)
