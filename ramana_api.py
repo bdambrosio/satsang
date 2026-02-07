@@ -110,6 +110,7 @@ def initialize_filtered_passages_rag():
     try:
         filtered_passages_rag = FilteredPassagesRAG(
             corpus_path=str(corpus_path),
+            llm_url="http://localhost:5000/v1",
         )
         logger.info("FilteredPassagesRAG initialized successfully")
     except Exception as e:
@@ -208,36 +209,29 @@ def retrieve_passages():
             'error': 'Missing request body'
         }), 400
     
-    # Build query from user_input, response, and expanded_response
+    # Extract dialogue components for semantic rewriting
     user_input = data.get('user_input', '')
     response = data.get('response', '')
     expanded_response = data.get('expanded_response', '')
     
     logger.info(f"Retrieve request - user_input length: {len(user_input)}, response length: {len(response)}, expanded_response length: {len(expanded_response)}")
     
-    # Combine into query
-    query_parts = []
-    if user_input:
-        query_parts.append(user_input)
-    if response:
-        query_parts.append(response)
-    if expanded_response:
-        query_parts.append(expanded_response)
-    
-    if not query_parts:
-        logger.info("No query parts, returning empty passages")
+    if not user_input and not response:
+        logger.info("No user_input or response, returning empty passages")
         return jsonify({
             'passages': []
         })
     
-    query_text = '. '.join(query_parts)
     top_k = data.get('top_k', 5)
     
-    logger.info(f"Query text (first 200 chars): {query_text[:200]}...")
-    logger.info(f"Requesting top_k={top_k} passages")
-    
     try:
-        passages = filtered_passages_rag.retrieve(query_text, top_k=top_k)
+        # Rewrite dialogue into semantic threads, then retrieve
+        passages = filtered_passages_rag.retrieve_with_rewrite(
+            user_input=user_input,
+            response=response,
+            expanded_response=expanded_response,
+            top_k=top_k,
+        )
         logger.info(f"Retrieved {len(passages)} passages")
         
         # Format passages for frontend (remove internal fields)

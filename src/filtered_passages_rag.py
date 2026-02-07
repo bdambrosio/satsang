@@ -12,11 +12,18 @@ and mapped back to the passage for retrieval.
 
 import json
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+try:
+    import httpx
+except ImportError:
+    raise ImportError("pip install httpx")
 
 try:
     import faiss
@@ -30,18 +37,47 @@ except ImportError:
     raise ImportError("pip install sentence-transformers")
 
 
+# Prompt that mirrors the semantic_thread creation task in passage_identification.py
+# but adapted for rewriting a dialogue (question + response) into embedding keys.
+SEMANTIC_THREAD_REWRITE_PROMPT = """You are generating embedding keys for a retrieval system that finds contemplative passages from world traditions that resonate with a dialogue about Ramana Maharshi's teachings.
+
+The retrieval corpus is indexed by "semantic threads": 1-3 brief descriptions (under 30 words each) of the contemplative or experiential meaning of each passage. These threads are expressed in clear, tradition-neutral language that captures the inner or spiritual territory the passage points to -- focusing on what it says about awareness, self, mind, realization, or lived contemplative experience.
+
+Your task: given the dialogue below, produce 1-3 semantic thread descriptions that capture the contemplative territory being explored. These will be embedded and compared against the corpus threads, so they must be written in the same register.
+
+GOOD thread: "Non-reliance on any fixed principle opens perception; clinging to method blinds, while letting go reveals clear seeing."
+BAD thread: "The user asks about meditation and the response discusses self-inquiry."
+
+Focus on the experiential and contemplative substance -- what territory of awareness, identity, mind, or realization is being pointed at? NOT the surface topic, rhetorical structure, or conversation mechanics.
+
+DIALOGUE:
+Question: {user_input}
+
+Response: {response}
+
+{expanded_section}
+Respond with ONLY a JSON array of 1-3 strings. No markdown, no explanation.
+"""
+
+
 class FilteredPassagesRAG:
     """
     RAG system for filtered passages corpus.
     
     Uses semantic_threads as embedding keys for retrieval.
     Each passage may have multiple semantic_threads, each embedded separately.
+    
+    Query rewriting: raw user dialogue is rewritten into semantic threads
+    via an LLM call, so the query embedding lives in the same semantic
+    space as the corpus embedding keys.
     """
     
     def __init__(
         self,
         corpus_path: str,
         embedding_model: str = "all-MiniLM-L6-v2",
+        llm_url: str = "http://localhost:5000/v1",
+        llm_model: Optional[str] = None,
     ):
         """
         Initialize RAG system.
@@ -49,9 +85,21 @@ class FilteredPassagesRAG:
         Args:
             corpus_path: Path to corpus.jsonl file
             embedding_model: Sentence transformer model name
+            llm_url: URL for the LLM API (used for query rewriting)
+            llm_model: Model name for LLM (auto-detected if None)
         """
         self.corpus_path = Path(corpus_path)
         self.embedding_model = embedding_model
+        self.llm_url = llm_url
+        self.llm_model = llm_model
+        
+        # HTTP client for LLM calls
+        self.http_client = httpx.Client(timeout=60.0)
+        
+        # Auto-detect LLM model if not provided
+        if self.llm_model is None:
+            self.llm_model = self._detect_llm_model()
+            logger.info(f"Auto-detected LLM model: {self.llm_model}")
         
         # Load embedding model
         logger.info(f"Loading embedding model: {embedding_model}")
@@ -70,6 +118,21 @@ class FilteredPassagesRAG:
         self._load_corpus()
         if self.passages:
             self._build_index()
+    
+    def _detect_llm_model(self) -> str:
+        """Auto-detect model from local vLLM API."""
+        try:
+            resp = self.http_client.get(f"{self.llm_url}/models")
+            resp.raise_for_status()
+            data = resp.json()
+            if "data" in data and len(data["data"]) > 0:
+                return data["data"][0]["id"]
+            else:
+                logger.warning("Could not detect LLM model, using 'unknown'")
+                return "unknown"
+        except Exception as e:
+            logger.warning(f"Could not detect LLM model: {e}")
+            return "unknown"
     
     def _load_corpus(self):
         """Load passages from corpus.jsonl."""
@@ -144,18 +207,132 @@ class FilteredPassagesRAG:
         
         logger.info(f"FAISS index built: {self.index.ntotal} vectors from {len(self.passages)} passages")
     
-    def retrieve(self, query_text: str, top_k: int = 5) -> list[dict]:
+    def rewrite_query_as_threads(
+        self,
+        user_input: str,
+        response: str,
+        expanded_response: str = "",
+    ) -> list[str]:
         """
-        Retrieve passages relevant to query text.
+        Rewrite a user dialogue into semantic threads via LLM call.
+        
+        Produces 1-3 thread descriptions in the same register as the
+        corpus semantic_threads, so both query and corpus embeddings
+        occupy the same semantic space.
         
         Args:
-            query_text: Query text to search for
+            user_input: The user's question
+            response: The generated response
+            expanded_response: The expanded response (may be empty)
+        
+        Returns:
+            List of 1-3 semantic thread strings
+        """
+        expanded_section = ""
+        if expanded_response:
+            expanded_section = f"Expanded Response: {expanded_response}"
+        
+        prompt = SEMANTIC_THREAD_REWRITE_PROMPT.format(
+            user_input=user_input,
+            response=response,
+            expanded_section=expanded_section,
+        )
+        
+        try:
+            resp = self.http_client.post(
+                f"{self.llm_url}/chat/completions",
+                json={
+                    "model": self.llm_model,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 512,
+                    "temperature": 0.3,
+                }
+            )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            
+            logger.info(f"LLM query rewrite raw output: {raw[:300]}")
+            
+            # Parse JSON array from response -- tolerate markdown fences
+            cleaned = raw
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r'^```\w*\n?', '', cleaned)
+                cleaned = re.sub(r'\n?```$', '', cleaned)
+                cleaned = cleaned.strip()
+            
+            threads = json.loads(cleaned)
+            
+            if not isinstance(threads, list):
+                logger.warning(f"LLM returned non-list: {type(threads)}")
+                return [raw]  # Fallback: use raw text as single thread
+            
+            # Filter to non-empty strings, cap at 3
+            threads = [t.strip() for t in threads if isinstance(t, str) and t.strip()][:3]
+            
+            if not threads:
+                logger.warning("LLM returned empty threads list, falling back to raw text")
+                return [f"{user_input}. {response}"]
+            
+            logger.info(f"Rewritten query into {len(threads)} semantic threads")
+            for i, t in enumerate(threads):
+                logger.info(f"  Thread {i+1}: {t}")
+            
+            return threads
+        
+        except Exception as e:
+            logger.error(f"LLM query rewrite failed: {e}", exc_info=True)
+            # Fallback: return raw concatenation so retrieval still works
+            logger.info("Falling back to raw text concatenation for retrieval")
+            parts = [p for p in [user_input, response, expanded_response] if p]
+            return ['. '.join(parts)]
+    
+    def retrieve_with_rewrite(
+        self,
+        user_input: str,
+        response: str,
+        expanded_response: str = "",
+        top_k: int = 5,
+    ) -> list[dict]:
+        """
+        Rewrite the dialogue into semantic threads, then retrieve.
+        
+        This is the primary retrieval interface. It rewrites the raw
+        dialogue into semantic threads via an LLM call, then searches
+        the corpus using those threads as queries.
+        
+        Args:
+            user_input: The user's question
+            response: The generated response
+            expanded_response: The expanded response (may be empty)
             top_k: Number of passages to return
         
         Returns:
             List of passage dicts with metadata, sorted by relevance
         """
-        logger.info(f"FilteredPassagesRAG.retrieve called with query_text length={len(query_text)}, top_k={top_k}")
+        threads = self.rewrite_query_as_threads(user_input, response, expanded_response)
+        return self.retrieve(threads, top_k=top_k)
+    
+    def retrieve(self, query_texts: str | list[str], top_k: int = 5) -> list[dict]:
+        """
+        Retrieve passages relevant to one or more query texts.
+        
+        When multiple query texts are provided (e.g. multiple semantic
+        threads), each is searched independently and results are merged
+        by best similarity per passage.
+        
+        Args:
+            query_texts: Single query string or list of query strings
+            top_k: Number of passages to return
+        
+        Returns:
+            List of passage dicts with metadata, sorted by relevance
+        """
+        if isinstance(query_texts, str):
+            query_texts = [query_texts]
+        
+        logger.info(f"FilteredPassagesRAG.retrieve called with {len(query_texts)} query texts, top_k={top_k}")
         
         if self.index is None or not self.passages:
             logger.warning(f"Index not built or no passages available - index={self.index is not None}, passages={len(self.passages) if self.passages else 0}")
@@ -164,59 +341,47 @@ class FilteredPassagesRAG:
         logger.info(f"Index has {self.index.ntotal} vectors, {len(self.passages)} passages available")
         
         try:
-            # Embed query
-            logger.debug("Encoding query text...")
-            query_embedding = self.embedder.encode([query_text], show_progress_bar=False)
-            query_embedding = np.array(query_embedding).astype('float32')
-            logger.debug(f"Query embedding shape: {query_embedding.shape}")
+            # Merge results across all query texts, keeping best similarity per passage
+            best_by_passage = {}  # passage_id -> (similarity, passage)
             
-            # Normalize for cosine similarity
-            faiss.normalize_L2(query_embedding)
+            for q_idx, query_text in enumerate(query_texts):
+                logger.info(f"Searching with query {q_idx+1}/{len(query_texts)}: {query_text[:120]}...")
+                
+                query_embedding = self.embedder.encode([query_text], show_progress_bar=False)
+                query_embedding = np.array(query_embedding).astype('float32')
+                faiss.normalize_L2(query_embedding)
+                
+                k = min(top_k * 3, self.index.ntotal)
+                similarities, indices = self.index.search(query_embedding, k)
+                
+                for similarity, thread_idx in zip(similarities[0], indices[0]):
+                    if thread_idx >= len(self.thread_to_passage):
+                        continue
+                    
+                    passage_idx = self.thread_to_passage[thread_idx]
+                    if passage_idx >= len(self.passages):
+                        continue
+                    
+                    passage = self.passages[passage_idx]
+                    passage_id = passage.get('passage_id')
+                    sim = float(similarity)
+                    
+                    # Keep best similarity for each passage
+                    if passage_id not in best_by_passage or sim > best_by_passage[passage_id][0]:
+                        best_by_passage[passage_id] = (sim, passage)
             
-            # Search
-            k = min(top_k * 3, self.index.ntotal)  # Get more results to deduplicate
-            logger.info(f"Searching index with k={k}")
-            similarities, indices = self.index.search(query_embedding, k)
-            logger.info(f"Search returned {len(indices[0])} results")
-            
-            # Map thread indices to passages and deduplicate
-            seen_passage_ids = set()
+            # Sort by similarity and take top_k
             results = []
-            
-            for similarity, thread_idx in zip(similarities[0], indices[0]):
-                if thread_idx >= len(self.thread_to_passage):
-                    logger.warning(f"Thread index {thread_idx} out of range (max: {len(self.thread_to_passage) - 1})")
-                    continue
-                
-                passage_idx = self.thread_to_passage[thread_idx]
-                if passage_idx >= len(self.passages):
-                    logger.warning(f"Passage index {passage_idx} out of range (max: {len(self.passages) - 1})")
-                    continue
-                
-                passage = self.passages[passage_idx]
-                passage_id = passage.get('passage_id')
-                
-                # Deduplicate by passage_id
-                if passage_id in seen_passage_ids:
-                    continue
-                
-                seen_passage_ids.add(passage_id)
-                
-                # Create result with similarity score
-                result = {
+            for passage_id, (sim, passage) in best_by_passage.items():
+                results.append({
                     **passage,
-                    'similarity': float(similarity),
-                }
-                results.append(result)
-                
-                # Stop when we have enough unique passages
-                if len(results) >= top_k:
-                    break
+                    'similarity': sim,
+                })
             
-            logger.info(f"Found {len(results)} unique passages after deduplication")
-            
-            # Sort by similarity (descending)
             results.sort(key=lambda x: x['similarity'], reverse=True)
+            results = results[:top_k]
+            
+            logger.info(f"Found {len(results)} passages after merging across {len(query_texts)} queries")
             
             return results
         
