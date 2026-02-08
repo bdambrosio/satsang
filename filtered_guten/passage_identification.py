@@ -210,7 +210,22 @@ def extract_passages(entry: dict, window: dict, model_name: str,
             timeout=180,
         )
         resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        data = resp.json()
+        choice0 = (data.get("choices") or [{}])[0] or {}
+        msg = choice0.get("message") or {}
+        content = msg.get("content")
+        if content is None:
+            # Some providers can return tool-call style responses with null content.
+            # Log a small snippet for diagnosis and treat as no extractions.
+            print("    LLM returned null message.content; skipping this window")
+            try:
+                snippet = json.dumps(data)[:500]
+            except Exception:
+                snippet = str(data)[:500]
+            print(f"    Response snippet (first 500): {snippet}")
+            return None
+
+        raw = str(content).strip()
 
         # Strip markdown fencing
         if raw.startswith("```"):
@@ -229,7 +244,11 @@ def extract_passages(entry: dict, window: dict, model_name: str,
 
     except json.JSONDecodeError as e:
         print(f"    JSON parse error: {e}")
-        print(f"    Raw (first 300): {raw[:300]}")
+        # raw may not be defined if we failed before reading content
+        try:
+            print(f"    Raw (first 300): {raw[:300]}")
+        except Exception:
+            pass
         return None
     except requests.exceptions.RequestException as e:
         print(f"    Request error: {e}")

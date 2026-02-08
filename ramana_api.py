@@ -61,6 +61,16 @@ SESSIONS_DIR = Path(__file__).parent / "sessions"
 SESSION_COOKIE_NAME = "ramana_session"
 SESSION_COOKIE_MAX_AGE = 365 * 24 * 3600  # 1 year
 
+# Conversational mode system prompt
+CONVERSATIONAL_SYSTEM = """You are a contemplative companion grounded in \
+Ramana Maharshi's teachings. You speak warmly but without flattery. You \
+invite inquiry rather than giving answers. You are patient with \
+confusion and meet the questioner where they are, gently turning \
+attention inward. You never prescribe practices or claim authority. \
+When silence would serve, you say so honestly rather than filling space. \
+You draw from Bhagavan's words and the spirit of his interactions with \
+visitors as recorded in the Commentaries and Talks."""
+
 # Session timeout for rollup (30 minutes of inactivity)
 SESSION_TIMEOUT_SECONDS = 30 * 60
 
@@ -748,15 +758,23 @@ def initialize_filtered_passages_rag():
 
 # ── Conversation History Builder ───────────────────────────────────────
 
-def _build_conversation_history(session_id: str) -> list[dict]:
+def _build_conversation_history(session_id: str, mode: str = "direct") -> list[dict]:
     """
     Build conversation_history for the generator.
     
     Includes:
+    - In conversational mode: warm system prompt
     - User model threads as a light-touch system hint (if available)
     - Last 2-3 turns as user/assistant pairs
     """
     history = []
+    
+    # In conversational mode, prepend the warm system prompt
+    if mode == "conversational":
+        history.append({
+            "role": "system",
+            "content": CONVERSATIONAL_SYSTEM,
+        })
     
     # User model as light-touch context
     threads = get_user_model_threads(session_id)
@@ -829,34 +847,47 @@ def handle_query():
     if not user_query:
         return jsonify({'error': 'Query cannot be empty'}), 400
     
+    mode = data.get('mode', 'direct')
+    if mode not in ('direct', 'conversational'):
+        mode = 'direct'
+    
     session_id = get_or_create_session_id()
     
     # Check for stale session and trigger rollup if needed
     check_and_rollup_stale_session(session_id)
     
     # Build conversation history for the generator
-    conversation_history = _build_conversation_history(session_id)
+    conversation_history = _build_conversation_history(session_id, mode=mode)
     
     try:
-        result = generator.generate(user_query, conversation_history=conversation_history)
+        result = generator.generate(user_query, conversation_history=conversation_history, mode=mode)
         response_text = result.get('response', '')
         is_silence = result.get('is_silence', False)
         
         if is_silence or not response_text or response_text == '[silence]':
-            # Record silence turn
-            append_turn(session_id, {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "user_input": user_query,
-                "response": "",
-                "is_silence": True,
-            })
-            
-            resp = jsonify({
-                'response': '',
-                'is_silence': True,
-                'message': 'Silence is sometimes the most appropriate response.',
-            })
-            return set_session_cookie(resp, session_id)
+            # In conversational mode, replace silence with a gentle acknowledgment
+            if mode == "conversational":
+                response_text = (
+                    "That question touches something deep. Rather than fill this "
+                    "space with words, I'd invite you to sit with it. What do you "
+                    "notice when you simply stay with the question?"
+                )
+                is_silence = False
+            else:
+                # Record silence turn
+                append_turn(session_id, {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "user_input": user_query,
+                    "response": "",
+                    "is_silence": True,
+                })
+                
+                resp = jsonify({
+                    'response': '',
+                    'is_silence': True,
+                    'message': 'Silence is sometimes the most appropriate response.',
+                })
+                return set_session_cookie(resp, session_id)
         
         # Record turn (expand + passages will update later)
         append_turn(session_id, {
@@ -894,6 +925,9 @@ def handle_expand():
     
     user_query = data['query'].strip()
     response_text = data['response'].strip()
+    mode = data.get('mode', 'direct')
+    if mode not in ('direct', 'conversational'):
+        mode = 'direct'
     
     if not user_query or not response_text:
         return jsonify({'expanded_response': ''})
@@ -905,7 +939,7 @@ def handle_expand():
     
     try:
         # First attempt
-        expanded_response = generator.expand(user_query, response_text)
+        expanded_response = generator.expand(user_query, response_text, mode=mode)
         if not expanded_response:
             return jsonify({'expanded_response': ''})
         
@@ -934,7 +968,7 @@ def handle_expand():
             f"Please generate a new expansion that avoids this issue.]"
         )
         
-        expanded_response_2 = generator.expand(augmented_query, response_text)
+        expanded_response_2 = generator.expand(augmented_query, response_text, mode=mode)
         if not expanded_response_2:
             logger.info("Retry expand returned empty, returning blank")
             return jsonify({'expanded_response': ''})

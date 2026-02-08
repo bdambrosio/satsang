@@ -160,12 +160,12 @@ Respond with JSON only."""
 # STALENESS MARKERS (for fast pre-filtering)
 # =============================================================================
 
-STALE_PHRASE_PATTERNS = [
+# Core stale patterns: active in ALL modes (prescriptive + generic spiritual)
+STALE_PHRASE_PATTERNS_CORE = [
     # Prescriptive patterns
     r'\byou should\b',
     r'\byou could try\b',
     r'\btry to\b',
-    r'\bconsider\b(?!ing)',  # "consider" as command, not "considering"
     r'\bi recommend\b',
     r'\bi suggest\b',
     r'\bhere are some\b',
@@ -174,12 +174,29 @@ STALE_PHRASE_PATTERNS = [
     r'\btips for\b',
     r'\bways to\b',
     
+    # Generic spiritual phrases
+    r'\bon your journey\b',
+    r'\byour path\b',
+    r'\binner wisdom\b',
+    r'\bhigher self\b',
+    r'\bthe universe\b',
+    r'\bmanifest\b',
+    r'\benergy\b(?! of)',  # standalone "energy"
+    r'\bvibration\b',
+    r'\balignment\b',
+]
+
+# Tone stale patterns: active in DIRECT mode only (relaxed in conversational)
+STALE_PHRASE_PATTERNS_TONE = [
     # Validation/agreement excess
     r'\bthat\'s (a )?(great|wonderful|excellent|good) (question|point|observation)\b',
     r'\bi (completely |totally )?understand\b',
     r'\bi hear you\b',
     r'\bthat makes sense\b',
     r'\byou\'re (absolutely |totally )?right\b',
+    
+    # "consider" as command (allowed in conversational as genuine inquiry)
+    r'\bconsider\b(?!ing)',
     
     # Explanation/teaching mode
     r'\blet me explain\b',
@@ -189,18 +206,10 @@ STALE_PHRASE_PATTERNS = [
     r'\bthe key (thing |point |idea )?is\b',
     r'\bessentially\b',
     r'\bfundamentally\b',
-    
-    # Generic spiritual phrases
-    r'\bon your journey\b',
-    r'\byour path\b',
-    r'\binner wisdom\b',
-    r'\bhigher self\b',
-    r'\bthe universe\b',
-    r'\bmanifest\b',
-    r'\benergy\b(?! of)',  # standalone "energy" 
-    r'\bvibration\b',
-    r'\balignment\b',
 ]
+
+# Combined list for backward compatibility (direct mode uses all)
+STALE_PHRASE_PATTERNS = STALE_PHRASE_PATTERNS_CORE + STALE_PHRASE_PATTERNS_TONE
 
 STALE_STRUCTURAL_PATTERNS = [
     # Lists and bullets (almost always stale in this context)
@@ -283,19 +292,28 @@ class BaseCritic(ABC):
     """Base class for aliveness critics."""
     
     @abstractmethod
-    def evaluate(self, user_input: str, response: str) -> CriticResult:
+    def evaluate(self, user_input: str, response: str, mode: str = "direct") -> CriticResult:
         """Evaluate a response for aliveness."""
         pass
     
-    def quick_stale_check(self, response: str) -> tuple[bool, list[str]]:
+    def quick_stale_check(self, response: str, mode: str = "direct") -> tuple[bool, list[str]]:
         """
         Fast pattern-based check for obvious staleness.
         Returns (is_obviously_stale, matched_patterns).
+        
+        In conversational mode, only core patterns are checked (tone
+        patterns like validation/agreement are relaxed).
         """
         matched = []
         response_lower = response.lower()
         
-        for pattern in STALE_PHRASE_PATTERNS:
+        # Core patterns active in all modes
+        phrase_patterns = STALE_PHRASE_PATTERNS_CORE
+        if mode == "direct":
+            # Direct mode also checks tone patterns
+            phrase_patterns = STALE_PHRASE_PATTERNS
+        
+        for pattern in phrase_patterns:
             if re.search(pattern, response_lower):
                 matched.append(pattern)
         
@@ -366,11 +384,11 @@ class LocalCritic(BaseCritic):
             logger.warning(f"Could not detect local model: {e}, using 'local-model'")
             return "local-model"
     
-    def evaluate(self, user_input: str, response: str) -> CriticResult:
+    def evaluate(self, user_input: str, response: str, mode: str = "direct") -> CriticResult:
         """Evaluate using local model API."""
         
         # Quick check
-        is_obviously_stale, stale_markers = self.quick_stale_check(response)
+        is_obviously_stale, stale_markers = self.quick_stale_check(response, mode=mode)
         if is_obviously_stale:
             return CriticResult(
                 score=2.0,
@@ -585,9 +603,13 @@ class ContemplativeGenerator:
             logger.warning(f"Failed to fetch available models: {e}")
             return []
     
-    def generate(self, user_input: str, conversation_history: Optional[list[dict]] = None) -> dict:
+    def generate(self, user_input: str, conversation_history: Optional[list[dict]] = None,
+                 mode: str = "direct") -> dict:
         """
         Generate a response, using critic to filter staleness.
+        
+        Args:
+            mode: "direct" (strict, terse) or "conversational" (warmer, relaxed)
         
         Returns:
             {
@@ -613,14 +635,19 @@ class ContemplativeGenerator:
         
         if is_rag_provider:
             # RAG provider returns multiple responses in one call
-            return self._generate_with_rag_provider(user_input, conversation_history)
+            return self._generate_with_rag_provider(user_input, conversation_history, mode=mode)
         else:
             # Standard provider: make multiple attempts
-            return self._generate_with_standard_provider(user_input, conversation_history)
+            return self._generate_with_standard_provider(user_input, conversation_history, mode=mode)
     
-    def _generate_with_rag_provider(self, user_input: str, conversation_history: list[dict]) -> dict:
+    def _generate_with_rag_provider(self, user_input: str, conversation_history: list[dict],
+                                    mode: str = "direct") -> dict:
         """Generate using RAG provider that returns multiple responses."""
         critic_results = []
+        
+        # Mode-aware settings
+        threshold = self.config.threshold if mode == "direct" else 4.5
+        max_tokens = 450 if mode == "direct" else 600
         
         # Generate all candidates in one call
         temperature = self.config.temperature_base
@@ -629,7 +656,7 @@ class ContemplativeGenerator:
         try:
             candidates = self.inference_provider.generate(
                 query=user_input,
-                max_new_tokens=450,
+                max_new_tokens=max_tokens,
                 temperature=temperature,
                 do_sample=True,
             )
@@ -660,7 +687,7 @@ class ContemplativeGenerator:
                 continue
             
             if self.critic:
-                result = self.critic.evaluate(user_input, candidate)
+                result = self.critic.evaluate(user_input, candidate, mode=mode)
                 critic_results.append(result)
                 
                 logger.debug(f"Response: {candidate[:80]}")
@@ -680,8 +707,8 @@ class ContemplativeGenerator:
                 "critic_results": critic_results,
             }
         
-        # Filter by threshold
-        acceptable = [c for c in scored_candidates if c["score"] >= self.config.threshold]
+        # Filter by threshold (mode-aware)
+        acceptable = [c for c in scored_candidates if c["score"] >= threshold]
         
         if acceptable:
             # Select using probabilities weighted by score (normalized)
@@ -732,25 +759,31 @@ class ContemplativeGenerator:
                 "critic_results": critic_results,
             }
     
-    def _generate_with_standard_provider(self, user_input: str, conversation_history: list[dict]) -> dict:
+    def _generate_with_standard_provider(self, user_input: str, conversation_history: list[dict],
+                                         mode: str = "direct") -> dict:
         """Generate using standard provider (multiple attempts)."""
         critic_results = []
         best_response = None
         best_score = 0.0
         
+        # Mode-aware threshold
+        threshold = self.config.threshold if mode == "direct" else 4.5
+        
         for attempt in range(self.config.max_attempts):
             # Increase temperature on retries
             temperature = self.config.temperature_base + (attempt * self.config.temperature_bump)
             
-            # Generate candidate
-            candidate = self._generate_candidate(user_input, conversation_history, temperature)
+            # Generate candidate (mode-aware max_tokens)
+            max_tokens = 300 if mode == "direct" else 500
+            candidate = self._generate_candidate(user_input, conversation_history, temperature,
+                                                  max_tokens=max_tokens)
             
             if not candidate:
                 continue
             
             # Evaluate with critic
             if self.critic:
-                result = self.critic.evaluate(user_input, candidate)
+                result = self.critic.evaluate(user_input, candidate, mode=mode)
                 critic_results.append(result)
                 
                 logger.debug(f"Attempt {attempt + 1}: response={candidate}")
@@ -758,7 +791,7 @@ class ContemplativeGenerator:
                 if result.stale_signals:
                     logger.debug(f"  Stale signals: {result.stale_signals[:3]}")
                 
-                if result.score >= self.config.threshold:
+                if result.score >= threshold:
                     # Good enough!
                     return {
                         "response": candidate,
@@ -802,7 +835,7 @@ class ContemplativeGenerator:
                 "critic_results": critic_results,
             }
     
-    def expand(self, query: str, response: str) -> Optional[str]:
+    def expand(self, query: str, response: str, mode: str = "direct") -> Optional[str]:
         """
         Expand a generated response into a longer, less abstract response 
         in the form of passages from Commentaries.
@@ -810,10 +843,27 @@ class ContemplativeGenerator:
         Args:
             query: The original user query
             response: The generated response to expand
+            mode: "direct" (terse) or "conversational" (more accessible)
             
         Returns:
             Expanded response string, or None if generation fails
         """
+        # Mode-aware style instruction
+        if mode == "conversational":
+            style_instruction = (
+                "Do NOT repeat the original response. Write 3-5 sentences that make the "
+                "response more accessible. Speak as a patient companion who has spent time "
+                "with these teachings. Use concrete language and, where helpful, a brief "
+                "example or analogy. Do not lecture or prescribe."
+            )
+        else:
+            style_instruction = (
+                "Do NOT repeat the original response, the goal it to make it more "
+                "accessible to those not familiar with all of Bhagavan's teachings. "
+                "Write 2 - 3 sentences, in the more informal style of Bhagavan's "
+                "statements in the Commentaries passages included above."
+            )
+        
         # Check if RAG provider is available and has passages access
         is_rag_provider = (
             ContemplativeRAGProvider is not None
@@ -851,7 +901,7 @@ class ContemplativeGenerator:
             prompt_parts.append("Your initial response:")
             prompt_parts.append(response)
             prompt_parts.append("")            
-            prompt_parts.append("Do NOT repeat the original response, the goal it to make it more accessible to those not familiar with all of Bhagavan's teachings. Write 2 - 3 sentences, in the more informal style of Bhagavan's statements in the Commentaries passages included above.")
+            prompt_parts.append(style_instruction)
             prompt_parts.append("End your response with: </end>")
             
             expand_prompt = "\n".join(prompt_parts)
@@ -873,7 +923,15 @@ class ContemplativeGenerator:
                 return None
         else:
             # Standard provider - build prompt with generated response
-            expand_prompt = f"""Original response:
+            if mode == "conversational":
+                expand_prompt = f"""Original response:
+{response}
+
+Expand this into a longer, more accessible response drawing from Ramana Maharshi's teachings. 
+Speak as a patient companion. Use concrete language and, where helpful, a brief example 
+or analogy. Do not lecture or prescribe. Write 3-5 sentences."""
+            else:
+                expand_prompt = f"""Original response:
 {response}
 
 Expand this into a longer, less abstract response in the style of Ramana Maharshi's teachings from Face_to_Face. 
@@ -934,6 +992,7 @@ Maintain the direct, pointing style. Make it more concrete and less abstract."""
         user_input: str,
         history: list[dict],
         temperature: float,
+        max_tokens: int = 300,
     ) -> Optional[str]:
         """Generate a single candidate response."""
         
@@ -944,7 +1003,7 @@ Maintain the direct, pointing style. Make it more concrete and less abstract."""
             try:
                 return self.inference_provider.generate_from_messages(
                     messages=messages,
-                    max_new_tokens=450,
+                    max_new_tokens=max_tokens + 150,  # provider uses token count differently
                     temperature=temperature,
                 )
             except Exception as e:
@@ -958,7 +1017,7 @@ Maintain the direct, pointing style. Make it more concrete and less abstract."""
                 json={
                     "model": self.generator_model,
                     "messages": messages,
-                    "max_tokens": 300,  # Keep responses short
+                    "max_tokens": max_tokens,
                     "temperature": temperature,
                 }
             )

@@ -19,32 +19,55 @@
             </div>
         </section>
 
+        <!-- Mode Toggle -->
+        <div class="mode-toggle">
+            <label class="mode-option">
+                <input type="radio" name="mode" value="direct" checked>
+                <span class="mode-label" title="Terse, contemplative pointing">Direct</span>
+            </label>
+            <label class="mode-option">
+                <input type="radio" name="mode" value="conversational">
+                <span class="mode-label" title="Gentler, more interactive dialogue">Conversational</span>
+            </label>
+        </div>
+
         <!-- Main Content Area -->
         <div class="main-layout">
             <main class="main-content">
+
+                <!-- Direct mode: single response/expand sections -->
+                <div id="direct-view">
+                    <section class="response-section" id="response-section" style="display: none;">
+                        <h2>Response</h2>
+                        <div id="response-text" class="response-text"></div>
+                    </section>
+
+                    <section class="expanded-response-section" id="expanded-response-section" style="display: none;">
+                        <h2>Expanded Response</h2>
+                        <div id="expanded-response-text" class="expanded-response-text"></div>
+                        <div id="expand-loading" class="loading-message" style="display: none;">Expanding...</div>
+                    </section>
+                </div>
+
+                <!-- Conversational mode: scrolling conversation pane -->
+                <div id="conv-view" style="display: none;">
+                    <div id="conv-history" class="conv-history">
+                        <!-- Turns appended here -->
+                    </div>
+                </div>
+
+                <!-- Query input (bottom, both modes) -->
                 <section class="query-section">
-                    <h2>Ask a Question</h2>
                     <form id="query-form">
                         <textarea 
                             id="query-input" 
                             name="query" 
                             placeholder="Enter your question..."
-                            rows="4"
+                            rows="3"
                             required
                         ></textarea>
                         <button type="submit" id="submit-btn">Submit</button>
                     </form>
-                </section>
-
-                <section class="response-section" id="response-section" style="display: none;">
-                    <h2>Response</h2>
-                    <div id="response-text" class="response-text"></div>
-                </section>
-
-                <section class="expanded-response-section" id="expanded-response-section" style="display: none;">
-                    <h2>Expanded Response</h2>
-                    <div id="expanded-response-text" class="expanded-response-text"></div>
-                    <div id="expand-loading" class="loading-message" style="display: none;">Expanding...</div>
                 </section>
             </main>
 
@@ -58,8 +81,109 @@
         </div>
     </div>
 
+    <!-- Expand Modal (conversational mode) -->
+    <div id="expand-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <button id="modal-close" class="modal-close">&times;</button>
+            <h2>Expanded Response</h2>
+            <div id="modal-expand-text" class="expanded-response-text"></div>
+        </div>
+    </div>
+
     <script>
-        // Load random Nan_Yar passage on page load
+        // ── Mode toggle persistence ──
+        function getMode() {
+            return document.querySelector('input[name="mode"]:checked').value;
+        }
+
+        function applyModeLayout() {
+            const mode = getMode();
+            const directView = document.getElementById('direct-view');
+            const convView = document.getElementById('conv-view');
+            if (mode === 'conversational') {
+                directView.style.display = 'none';
+                convView.style.display = 'block';
+            } else {
+                directView.style.display = 'block';
+                convView.style.display = 'none';
+            }
+        }
+
+        function restoreMode() {
+            const saved = localStorage.getItem('ramana_mode');
+            if (saved === 'conversational') {
+                document.querySelector('input[name="mode"][value="conversational"]').checked = true;
+            }
+            applyModeLayout();
+        }
+
+        document.querySelectorAll('input[name="mode"]').forEach(radio => {
+            radio.addEventListener('change', () => {
+                localStorage.setItem('ramana_mode', getMode());
+                applyModeLayout();
+            });
+        });
+        restoreMode();
+
+        // ── Modal ──
+        function openExpandModal(text) {
+            document.getElementById('modal-expand-text').textContent = text;
+            document.getElementById('expand-modal').style.display = 'flex';
+        }
+        function closeExpandModal() {
+            document.getElementById('expand-modal').style.display = 'none';
+        }
+        document.getElementById('modal-close').addEventListener('click', closeExpandModal);
+        document.getElementById('expand-modal').addEventListener('click', (e) => {
+            if (e.target === e.currentTarget) closeExpandModal();
+        });
+
+        // ── Conversation pane helpers ──
+        function appendConvTurn(query, responseText) {
+            const history = document.getElementById('conv-history');
+            const turn = document.createElement('div');
+            turn.className = 'conv-turn';
+
+            const qDiv = document.createElement('div');
+            qDiv.className = 'conv-question';
+            qDiv.textContent = query;
+
+            const rDiv = document.createElement('div');
+            rDiv.className = 'conv-response';
+            rDiv.textContent = responseText;
+
+            turn.appendChild(qDiv);
+            turn.appendChild(rDiv);
+            history.appendChild(turn);
+
+            // Return turn element so we can add expand link later
+            return turn;
+        }
+
+        function addExpandLink(turnEl, expandedText) {
+            if (!expandedText) return;
+            const link = document.createElement('button');
+            link.className = 'conv-expand-link';
+            link.textContent = 'Expanded response\u2026';
+            link.addEventListener('click', () => openExpandModal(expandedText));
+            turnEl.appendChild(link);
+        }
+
+        function addConvLoading(turnEl) {
+            const loading = document.createElement('div');
+            loading.className = 'conv-loading';
+            loading.textContent = 'Expanding\u2026';
+            loading.id = 'conv-loading-indicator';
+            turnEl.appendChild(loading);
+            return loading;
+        }
+
+        function scrollConvToBottom() {
+            const history = document.getElementById('conv-history');
+            history.scrollTop = history.scrollHeight;
+        }
+
+        // ── Load Nan_Yar passage ──
         async function loadNanYar() {
             try {
                 const response = await fetch('/api/nan-yar');
@@ -79,13 +203,14 @@
             }
         }
 
-        // Handle form submission — progressive flow
+        // ── Form submission — progressive flow ──
         document.getElementById('query-form').addEventListener('submit', async (e) => {
             e.preventDefault();
             
             const queryInput = document.getElementById('query-input');
             const submitBtn = document.getElementById('submit-btn');
             const query = queryInput.value.trim();
+            const mode = getMode();
             
             if (!query) return;
             
@@ -93,54 +218,80 @@
             submitBtn.disabled = true;
             submitBtn.textContent = 'Processing...';
             
-            // Clear previous
-            document.getElementById('response-section').style.display = 'none';
-            document.getElementById('expanded-response-section').style.display = 'none';
-            document.getElementById('expand-loading').style.display = 'none';
+            if (mode === 'direct') {
+                // ── Direct mode: replace sections ──
+                document.getElementById('response-section').style.display = 'none';
+                document.getElementById('expanded-response-section').style.display = 'none';
+                document.getElementById('expand-loading').style.display = 'none';
+            }
+            
             document.getElementById('passages-list').innerHTML = 
                 '<p class="empty-message">Waiting for response...</p>';
             
             try {
-                // Step 1: Get initial response (blocks until ready)
+                // Step 1: Get initial response
                 const queryResponse = await fetch('/api/query', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query: query }),
+                    body: JSON.stringify({ query: query, mode: mode }),
                 });
                 const queryData = await queryResponse.json();
                 
                 if (queryData.error) throw new Error(queryData.error);
                 
-                // Display response immediately
+                // Handle silence
                 if (queryData.is_silence) {
-                    document.getElementById('response-text').textContent = 
-                        queryData.message || 'Silence is sometimes the most appropriate response.';
-                    document.getElementById('response-section').style.display = 'block';
-                    // Re-enable form — nothing more to do
+                    const silenceMsg = queryData.message || 'Silence is sometimes the most appropriate response.';
+                    if (mode === 'direct') {
+                        document.getElementById('response-text').textContent = silenceMsg;
+                        document.getElementById('response-section').style.display = 'block';
+                    } else {
+                        appendConvTurn(query, silenceMsg);
+                        scrollConvToBottom();
+                    }
                     submitBtn.disabled = false;
                     submitBtn.textContent = 'Submit';
                     document.getElementById('passages-list').innerHTML = 
                         '<p class="empty-message"></p>';
+                    queryInput.value = '';
                     return;
                 }
                 
                 const responseText = queryData.response || '';
-                if (responseText) {
-                    document.getElementById('response-text').textContent = responseText;
-                    document.getElementById('response-section').style.display = 'block';
+                
+                if (mode === 'direct') {
+                    // Direct mode: show in sections
+                    if (responseText) {
+                        document.getElementById('response-text').textContent = responseText;
+                        document.getElementById('response-section').style.display = 'block';
+                    }
+                    
+                    // Re-enable form
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Submit';
+                    
+                    // Show expand loading
+                    document.getElementById('expanded-response-section').style.display = 'block';
+                    document.getElementById('expand-loading').style.display = 'block';
+                    document.getElementById('expanded-response-text').textContent = '';
+                    
+                    // Kick off expand + passages
+                    fetchExpandThenPassagesDirect(query, responseText);
+                    
+                } else {
+                    // Conversational mode: append to history
+                    const turnEl = appendConvTurn(query, responseText);
+                    const loadingEl = addConvLoading(turnEl);
+                    scrollConvToBottom();
+                    
+                    // Re-enable form, clear input
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Submit';
+                    queryInput.value = '';
+                    
+                    // Kick off expand + passages
+                    fetchExpandThenPassagesConv(query, responseText, turnEl, loadingEl);
                 }
-                
-                // Re-enable form immediately — expand and passages load in background
-                submitBtn.disabled = false;
-                submitBtn.textContent = 'Submit';
-                
-                // Step 2: Expand (non-blocking — show loading indicator)
-                document.getElementById('expanded-response-section').style.display = 'block';
-                document.getElementById('expand-loading').style.display = 'block';
-                document.getElementById('expanded-response-text').textContent = '';
-                
-                // Step 3: Kick off expand and use its result for passages
-                fetchExpandThenPassages(query, responseText);
                 
             } catch (error) {
                 console.error('Error:', error);
@@ -150,17 +301,16 @@
                 submitBtn.textContent = 'Submit';
             }
         });
-        
-        // Fetch expand, then use result to fetch passages
-        async function fetchExpandThenPassages(query, responseText) {
+
+        // ── Direct mode: fetch expand then passages ──
+        async function fetchExpandThenPassagesDirect(query, responseText) {
             let expandedText = '';
             
-            // Fetch expand
             try {
                 const expandResponse = await fetch('/api/expand', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query: query, response: responseText }),
+                    body: JSON.stringify({ query: query, response: responseText, mode: 'direct' }),
                 });
                 const expandData = await expandResponse.json();
                 
@@ -170,7 +320,6 @@
                     expandedText = expandData.expanded_response;
                     document.getElementById('expanded-response-text').textContent = expandedText;
                 } else {
-                    // No expanded response — hide the section
                     document.getElementById('expanded-response-section').style.display = 'none';
                 }
             } catch (error) {
@@ -179,7 +328,39 @@
                 document.getElementById('expanded-response-section').style.display = 'none';
             }
             
-            // Fetch passages (uses expand result)
+            fetchPassages(query, responseText, expandedText);
+        }
+
+        // ── Conversational mode: fetch expand then passages ──
+        async function fetchExpandThenPassagesConv(query, responseText, turnEl, loadingEl) {
+            let expandedText = '';
+            
+            try {
+                const expandResponse = await fetch('/api/expand', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: query, response: responseText, mode: 'conversational' }),
+                });
+                const expandData = await expandResponse.json();
+                
+                // Remove loading indicator
+                if (loadingEl && loadingEl.parentNode) loadingEl.remove();
+                
+                if (expandData.expanded_response) {
+                    expandedText = expandData.expanded_response;
+                    addExpandLink(turnEl, expandedText);
+                    scrollConvToBottom();
+                }
+            } catch (error) {
+                console.error('Error expanding:', error);
+                if (loadingEl && loadingEl.parentNode) loadingEl.remove();
+            }
+            
+            fetchPassages(query, responseText, expandedText);
+        }
+
+        // ── Shared: fetch passages ──
+        async function fetchPassages(query, responseText, expandedText) {
             document.getElementById('passages-list').innerHTML = 
                 '<p class="loading-message">Finding related passage...</p>';
             
@@ -191,6 +372,7 @@
                         user_input: query,
                         response: responseText,
                         expanded_response: expandedText,
+                        mode: getMode(),
                     }),
                 });
                 const passagesData = await passagesResponse.json();
@@ -203,7 +385,6 @@
                     return;
                 }
                 
-                // Display passage(s)
                 let html = '';
                 passages.forEach((passage) => {
                     html += `

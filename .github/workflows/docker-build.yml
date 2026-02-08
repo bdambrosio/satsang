@@ -18,7 +18,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/ramana_api
+  IMAGE_NAME: ${{ github.repository }}/ramana_web
 
 jobs:
   build-and-push:

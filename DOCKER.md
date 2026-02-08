@@ -15,7 +15,7 @@ If the image has been built and pushed to GitHub Container Registry:
 
 ```bash
 # Pull the image (replace OWNER/REPO with your GitHub username/repo)
-docker pull ghcr.io/OWNER/REPO/ramana_api:latest
+docker pull ghcr.io/OWNER/REPO/ramana_web:latest
 
 # Run the container
 docker run -d \
@@ -23,14 +23,61 @@ docker run -d \
   -p 5001:5001 \
   -e OPENROUTER_API_KEY="your-api-key-here" \
   -v $(pwd)/sessions:/app/sessions \
-  ghcr.io/OWNER/REPO/ramana_api:latest
+  ghcr.io/OWNER/REPO/ramana_web:latest
 ```
 
-### Option 2: Build Locally
+### Option 2: Build and Push to GitHub Container Registry Manually
 
 1. **Build the Docker image:**
    ```bash
-   docker build -t ramana-api .
+   docker build -t ramana-web .
+   ```
+
+2. **Tag the image for GitHub Container Registry:**
+   ```bash
+   # Replace YOUR_USERNAME and YOUR_REPO with your GitHub username and repository name
+   docker tag ramana-web ghcr.io/YOUR_USERNAME/YOUR_REPO/ramana_web:latest
+   ```
+
+3. **Authenticate with GitHub Container Registry:**
+   
+   **Option A: Using Personal Access Token (if available):**
+   - Go to: https://github.com/settings/tokens
+   - Click "Generate new token" → "Generate new token (classic)"
+   - Give it a name (e.g., "Docker Push")
+   - Look for **"Packages"** permission (may be under Account or Repository permissions)
+   - If you can't find it, try selecting **"repo"** scope (full repository access)
+   - Click "Generate token" and copy it
+   
+   Then login:
+   ```bash
+   docker login ghcr.io -u YOUR_USERNAME
+   # When prompted for password, paste your token
+   ```
+   
+   **Option B: Using GitHub username/password (simpler):**
+   ```bash
+   docker login ghcr.io -u YOUR_USERNAME
+   # When prompted for password, enter your GitHub password
+   # If you have 2FA enabled, you'll need to create a token (see Option A)
+   ```
+   
+   **Note**: If you have 2FA enabled, you MUST use a Personal Access Token (Option A).
+
+4. **Push the image:**
+   ```bash
+   docker push ghcr.io/YOUR_USERNAME/YOUR_REPO/ramana_web:latest
+   ```
+
+5. **Make the package public (optional):**
+   - Go to: https://github.com/YOUR_USERNAME/YOUR_REPO/pkgs/container/ramana_web
+   - Click "Package settings" → "Change visibility" → "Public"
+
+### Option 3: Build Locally (No Push)
+
+1. **Build the Docker image:**
+   ```bash
+   docker build -t ramana-web .
    ```
 
 2. **Run the container:**
@@ -40,7 +87,7 @@ docker run -d \
      -p 5001:5001 \
      -e OPENROUTER_API_KEY="your-api-key-here" \
      -v $(pwd)/sessions:/app/sessions \
-     ramana-api
+     ramana-web
    ```
 
 The container defaults to:
@@ -88,20 +135,20 @@ The `sessions/` directory is mounted as a volume to persist conversation history
 ### Viewing Logs
 
 ```bash
-docker logs -f ramana-api
+docker logs -f ramana-web
 ```
 
 ### Stopping the Container
 
 ```bash
-docker stop ramana-api
-docker rm ramana-api
+docker stop ramana-web
+docker rm ramana-web
 ```
 
 ### Restarting the Container
 
 ```bash
-docker restart ramana-api
+docker restart ramana-web
 ```
 
 ## Production Considerations
@@ -122,7 +169,7 @@ docker restart ramana-api
 **Container fails to start:**
 - Check that `OPENROUTER_API_KEY` is set correctly
 - Verify `corpus.jsonl` exists in `filtered_guten/filtered_passages/`
-- Check logs: `docker logs ramana-api`
+- Check logs: `docker logs ramana-web`
 
 **"No passages loaded" warning:**
 - Ensure `filtered_guten/filtered_passages/corpus.jsonl` exists and is included in the build
