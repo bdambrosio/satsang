@@ -183,6 +183,13 @@
             history.scrollTop = history.scrollHeight;
         }
 
+        // Escape HTML to prevent XSS
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
         // ── Load Nan_Yar passage ──
         async function loadNanYar() {
             try {
@@ -190,8 +197,11 @@
                 const data = await response.json();
                 
                 if (data.passage) {
-                    document.getElementById('nan-yar-passage').innerHTML = 
-                        '<p>' + data.passage.replace(/\n/g, '<br>') + '</p>';
+                    let html = '<p>' + data.passage.replace(/\n/g, '<br>') + '</p>';
+                    if (data.source) {
+                        html += '<p class="passage-source">— ' + escapeHtml(data.source) + '</p>';
+                    }
+                    document.getElementById('nan-yar-passage').innerHTML = html;
                 } else {
                     document.getElementById('nan-yar-passage').innerHTML = 
                         '<p>Unable to load passage.</p>';
@@ -406,13 +416,6 @@
                 document.getElementById('passages-list').innerHTML = 
                     '<p class="empty-message"></p>';
             }
-        }
-        
-        // Escape HTML to prevent XSS
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
         }
         
         // Load Nan_Yar on page load

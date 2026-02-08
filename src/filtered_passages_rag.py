@@ -15,6 +15,94 @@ import logging
 import os
 import re
 from pathlib import Path
+
+
+def repair_json_response(raw: str, response_obj: dict = None) -> tuple[str, bool]:
+    """
+    Attempt to repair a malformed JSON response from an LLM.
+    
+    Steps:
+    1. Remove markdown code fences
+    2. Extract text between first '{'/'[' and last matching '}'/']'
+    3. Check if response was truncated (via finish_reason or abrupt ending)
+    
+    Args:
+        raw: Raw LLM response text
+        response_obj: Full API response object (to check finish_reason)
+    
+    Returns:
+        (repaired_json_string, was_truncated)
+    """
+    was_truncated = False
+    
+    # Check for truncation in response object
+    if response_obj:
+        choice = response_obj.get("choices", [{}])[0] if response_obj.get("choices") else {}
+        finish_reason = choice.get("finish_reason", "")
+        if finish_reason in ("length", "max_tokens"):
+            was_truncated = True
+            logger.warning(f"LLM response truncated (finish_reason={finish_reason})")
+    
+    # Remove markdown code fences
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # Remove opening fence
+        cleaned = re.sub(r'^```\w*\n?', '', cleaned)
+        # Remove closing fence
+        cleaned = re.sub(r'\n?```$', '', cleaned)
+        cleaned = cleaned.strip()
+    
+    # Check if empty after cleaning
+    if not cleaned:
+        logger.warning("LLM returned empty response after cleaning")
+        return "", was_truncated
+    
+    # Extract JSON between first '{'/'[' and last matching '}'/']'
+    first_brace = cleaned.find('{')
+    first_bracket = cleaned.find('[')
+    
+    if first_brace == -1 and first_bracket == -1:
+        logger.warning(f"No JSON structure found in response. Raw: {raw[:200]}")
+        return cleaned, was_truncated
+    
+    # Determine which comes first
+    if first_bracket == -1 or (first_brace != -1 and first_brace < first_bracket):
+        # JSON object
+        start_char = '{'
+        end_char = '}'
+        start_idx = first_brace
+    else:
+        # JSON array
+        start_char = '['
+        end_char = ']'
+        start_idx = first_bracket
+    
+    # Find matching closing brace/bracket
+    depth = 0
+    end_idx = -1
+    for i in range(start_idx, len(cleaned)):
+        char = cleaned[i]
+        if char == start_char:
+            depth += 1
+        elif char == end_char:
+            depth -= 1
+            if depth == 0:
+                end_idx = i + 1
+                break
+    
+    if end_idx == -1:
+        # Unmatched brackets - likely truncated
+        was_truncated = True
+        logger.warning("Unmatched JSON brackets detected - response likely truncated")
+        # Try to extract what we have
+        extracted = cleaned[start_idx:]
+    else:
+        extracted = cleaned[start_idx:end_idx]
+    
+    # Remove any leading/trailing non-JSON text
+    extracted = extracted.strip()
+    
+    return extracted, was_truncated
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +144,7 @@ Question: {user_input}
 Response: {response}
 
 {expanded_section}
-Respond with ONLY a JSON array of 1-3 strings. No markdown, no explanation.
+Respond with ONLY a JSON array of 1-3 strings. No markdown, no preamble, no introductory text, no explanation, no reasoning. Just the JSON array.
 """
 
 
@@ -78,6 +166,7 @@ class FilteredPassagesRAG:
         embedding_model: str = "all-MiniLM-L6-v2",
         llm_url: str = "http://localhost:5000/v1",
         llm_model: Optional[str] = None,
+        llm_backend: Optional[str] = None,
     ):
         """
         Initialize RAG system.
@@ -87,14 +176,18 @@ class FilteredPassagesRAG:
             embedding_model: Sentence transformer model name
             llm_url: URL for the LLM API (used for query rewriting)
             llm_model: Model name for LLM (auto-detected if None for local, required for OpenRouter)
+            llm_backend: Backend type ("local" or "openrouter"). If None, detected from URL.
         """
         self.corpus_path = Path(corpus_path)
         self.embedding_model = embedding_model
         self.llm_url = llm_url
         self.llm_model = llm_model
         
-        # Detect backend from URL
-        self.llm_backend = "openrouter" if "openrouter.ai" in llm_url else "local"
+        # Use explicit backend if provided, otherwise detect from URL
+        if llm_backend:
+            self.llm_backend = llm_backend
+        else:
+            self.llm_backend = "openrouter" if "openrouter.ai" in llm_url else "local"
         
         # HTTP client for LLM calls
         self.http_client = httpx.Client(timeout=60.0)
@@ -264,6 +357,10 @@ class FilteredPassagesRAG:
                 "temperature": 0.3,
             }
             
+            # Add reasoning parameter for OpenRouter (if supported)
+            if self.llm_backend == "openrouter":
+                payload["reasoning"] = {"effort": "low"}
+            
             # Build headers (OpenRouter needs auth)
             headers = {}
             if self.llm_backend == "openrouter":
@@ -280,23 +377,32 @@ class FilteredPassagesRAG:
                 headers=headers,
             )
             resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            response_data = resp.json()
+            raw = response_data["choices"][0]["message"]["content"].strip()
             
             logger.info(f"LLM query rewrite raw output: {raw[:300]}")
             
-            # Parse JSON array from response -- tolerate markdown fences
-            cleaned = raw
-            if cleaned.startswith("```"):
-                cleaned = re.sub(r'^```\w*\n?', '', cleaned)
-                cleaned = re.sub(r'\n?```$', '', cleaned)
-                cleaned = cleaned.strip()
+            # Repair JSON response
+            repaired, was_truncated = repair_json_response(raw, response_data)
+            if was_truncated:
+                logger.warning("Query rewrite response was truncated - JSON may be incomplete")
             
             # LLM sometimes returns multiple JSON arrays on separate lines
             # e.g. ["thread1"]\n["thread2"]\n["thread3"]
             # Try direct parse first; on failure, merge separate arrays
             try:
-                threads = json.loads(cleaned)
-            except json.JSONDecodeError:
+                if repaired:
+                    threads = json.loads(repaired)
+                else:
+                    raise ValueError("Empty JSON after repair")
+            except (json.JSONDecodeError, ValueError):
+                # Fallback: try parsing each line separately
+                cleaned = raw.strip()
+                if cleaned.startswith("```"):
+                    cleaned = re.sub(r'^```\w*\n?', '', cleaned)
+                    cleaned = re.sub(r'\n?```$', '', cleaned)
+                    cleaned = cleaned.strip()
+                
                 merged = []
                 for line in cleaned.splitlines():
                     line = line.strip()
@@ -337,8 +443,11 @@ class FilteredPassagesRAG:
         
         except Exception as e:
             logger.error(f"LLM query rewrite failed: {e}", exc_info=True)
+            if 'raw' in locals():
+                logger.error(f"Raw response (first 500 chars): {raw[:500]}")
             # Fallback: return raw concatenation so retrieval still works
-            logger.info("Falling back to raw text concatenation for retrieval")
+            logger.warning("Falling back to raw text concatenation for retrieval "
+                           "(quality will degrade: raw text vs semantic-thread embeddings)")
             parts = [p for p in [user_input, response, expanded_response] if p]
             return ['. '.join(parts)]
     
@@ -409,7 +518,9 @@ class FilteredPassagesRAG:
                 query_embedding = np.array(query_embedding).astype('float32')
                 faiss.normalize_L2(query_embedding)
                 
-                k = min(top_k * 3, self.index.ntotal)
+                # Over-fetch per query thread, then merge best across threads.
+                # With N query threads this is N * top_k * 2 FAISS lookups total.
+                k = min(top_k * 2, self.index.ntotal)
                 similarities, indices = self.index.search(query_embedding, k)
                 
                 for similarity, thread_idx in zip(similarities[0], indices[0]):
@@ -476,7 +587,15 @@ if __name__ == "__main__":
     
     rag = FilteredPassagesRAG(corpus_path=args.corpus)
     
-    results = rag.retrieve(args.query, top_k=args.top_k)
+    # Use retrieve_with_rewrite so the CLI tests the same semantic-thread
+    # normalization pipeline that the server uses.  retrieve() alone would
+    # compare raw text against semantic-thread embeddings — a space mismatch.
+    results = rag.retrieve_with_rewrite(
+        user_input=args.query,
+        response="",
+        expanded_response="",
+        top_k=args.top_k,
+    )
     
     print(f"\nQuery: {args.query}")
     print(f"\nRetrieved {len(results)} passages:\n")

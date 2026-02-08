@@ -57,6 +57,14 @@ header h1 {
     margin: 0;
 }
 
+.nan-yar-passage .passage-source {
+    margin-top: 12px;
+    font-size: 0.85em;
+    font-style: normal;
+    color: #888;
+    font-weight: normal;
+}
+
 /* Mode Toggle */
 .mode-toggle {
     display: flex;

@@ -57,6 +57,96 @@ llm_model = None  # Model name (required for OpenRouter, auto-detected for local
 
 SESSIONS_DIR = Path(__file__).parent / "sessions"
 
+
+# ── JSON Repair Utility ──────────────────────────────────────────────
+
+def repair_json_response(raw: str, response_obj: dict = None) -> tuple[str, bool]:
+    """
+    Attempt to repair a malformed JSON response from an LLM.
+    
+    Steps:
+    1. Remove markdown code fences
+    2. Extract text between first '{'/'[' and last matching '}'/']'
+    3. Check if response was truncated (via finish_reason or abrupt ending)
+    
+    Args:
+        raw: Raw LLM response text
+        response_obj: Full API response object (to check finish_reason)
+    
+    Returns:
+        (repaired_json_string, was_truncated)
+    """
+    was_truncated = False
+    
+    # Check for truncation in response object
+    if response_obj:
+        choice = response_obj.get("choices", [{}])[0] if response_obj.get("choices") else {}
+        finish_reason = choice.get("finish_reason", "")
+        if finish_reason in ("length", "max_tokens"):
+            was_truncated = True
+            logger.warning(f"LLM response truncated (finish_reason={finish_reason})")
+    
+    # Remove markdown code fences
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # Remove opening fence
+        cleaned = re.sub(r'^```\w*\n?', '', cleaned)
+        # Remove closing fence
+        cleaned = re.sub(r'\n?```$', '', cleaned)
+        cleaned = cleaned.strip()
+    
+    # Check if empty after cleaning
+    if not cleaned:
+        logger.warning("LLM returned empty response after cleaning")
+        return "", was_truncated
+    
+    # Extract JSON between first '{'/'[' and last matching '}'/']'
+    first_brace = cleaned.find('{')
+    first_bracket = cleaned.find('[')
+    
+    if first_brace == -1 and first_bracket == -1:
+        logger.warning(f"No JSON structure found in response. Raw: {raw[:200]}")
+        return cleaned, was_truncated
+    
+    # Determine which comes first
+    if first_bracket == -1 or (first_brace != -1 and first_brace < first_bracket):
+        # JSON object
+        start_char = '{'
+        end_char = '}'
+        start_idx = first_brace
+    else:
+        # JSON array
+        start_char = '['
+        end_char = ']'
+        start_idx = first_bracket
+    
+    # Find matching closing brace/bracket
+    depth = 0
+    end_idx = -1
+    for i in range(start_idx, len(cleaned)):
+        char = cleaned[i]
+        if char == start_char:
+            depth += 1
+        elif char == end_char:
+            depth -= 1
+            if depth == 0:
+                end_idx = i + 1
+                break
+    
+    if end_idx == -1:
+        # Unmatched brackets - likely truncated
+        was_truncated = True
+        logger.warning("Unmatched JSON brackets detected - response likely truncated")
+        # Try to extract what we have
+        extracted = cleaned[start_idx:]
+    else:
+        extracted = cleaned[start_idx:end_idx]
+    
+    # Remove any leading/trailing non-JSON text
+    extracted = extracted.strip()
+    
+    return extracted, was_truncated
+
 # Session cookie settings
 SESSION_COOKIE_NAME = "ramana_session"
 SESSION_COOKIE_MAX_AGE = 365 * 24 * 3600  # 1 year
@@ -100,14 +190,12 @@ Expanded: {expanded_response}
 {passage_text}
 --- {passage_author}, {passage_title} ({passage_tradition}) ---
 
-Respond with ONLY a JSON object:
+Respond with ONLY a JSON object. No markdown, no preamble, no introductory text, no explanation, no reasoning. Just the JSON:
 {{
   "show": true or false,
   "confidence": <float 0.0 to 1.0>,
   "reason": "<terse, 6-10 words max>"
-}}
-
-No markdown, no preamble."""
+}}"""
 
 # Expand post-filter prompt
 EXPAND_FILTER_PROMPT = """You are reviewing an expanded response for a website devoted to Ramana Maharshi's teachings. The original response was a brief, direct pointing. The expanded version elaborates on it, drawing from Commentaries and related teachings.
@@ -129,15 +217,13 @@ Original Response: {response}
 
 If the expanded response fails these criteria, provide a brief rewrite instruction explaining what's wrong and how to fix it.
 
-Respond with ONLY a JSON object:
+Respond with ONLY a JSON object. No markdown, no preamble, no introductory text, no explanation, no reasoning. Just the JSON:
 {{
   "acceptable": true or false,
   "confidence": <float 0.0 to 1.0>,
   "reason": "<terse, 6-10 words max>",
   "rewrite_instruction": "<brief instruction if not acceptable, else null>"
-}}
-
-No markdown, no preamble."""
+}}"""
 
 # Session rollup prompt: generates a user model from conversation history
 SESSION_ROLLUP_PROMPT = """You are maintaining a contemplative interest profile for a visitor to a website devoted to Ramana Maharshi's teachings. Given this visitor's conversation history (and optionally their previous profile), produce an updated set of semantic threads that capture the contemplative territory this person is drawn to.
@@ -153,7 +239,7 @@ Produce 3-7 threads that form a coherent portrait of this visitor's contemplativ
 CONVERSATION HISTORY:
 {conversation_history}
 
-Respond with ONLY a JSON object:
+Respond with ONLY a JSON object. No markdown, no preamble, no introductory text, no explanation, no reasoning. Just the JSON:
 {{
   "semantic_threads": ["<thread1>", "<thread2>", ...],
   "themes": ["<theme1>", "<theme2>", ...]
@@ -214,7 +300,8 @@ def load_user_model(session_id: str) -> dict:
     Load the user model (rollup) for a session.
     
     Returns:
-        {"semantic_threads": [...], "themes": [...]} or empty dict
+        {"semantic_threads": [...], "themes": [...], "shown_nan_yar_indices": [...], 
+         "shown_sidebar_passage_ids": [...]} or empty dict
     """
     rollup_file = get_rollup_file(session_id)
     if not rollup_file.exists():
@@ -224,6 +311,48 @@ def load_user_model(session_id: str) -> dict:
             return json.loads(f.read())
     except (json.JSONDecodeError, IOError):
         return {}
+
+
+def get_shown_nan_yar_indices(session_id: str) -> set[int]:
+    """Get set of Nan_Yar passage indices already shown to this session."""
+    model = load_user_model(session_id)
+    return set(model.get("shown_nan_yar_indices", []))
+
+
+def mark_nan_yar_shown(session_id: str, passage_idx: int):
+    """Mark a Nan_Yar passage as shown for this session."""
+    rollup_file = get_rollup_file(session_id)
+    model = load_user_model(session_id)
+    
+    shown = set(model.get("shown_nan_yar_indices", []))
+    shown.add(passage_idx)
+    model["shown_nan_yar_indices"] = list(shown)
+    
+    # Ensure rollup file directory exists
+    rollup_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(rollup_file, "w") as f:
+        f.write(json.dumps(model))
+
+
+def get_shown_sidebar_passage_ids(session_id: str) -> set[str]:
+    """Get set of sidebar passage_ids already shown to this session."""
+    model = load_user_model(session_id)
+    return set(model.get("shown_sidebar_passage_ids", []))
+
+
+def mark_sidebar_passage_shown(session_id: str, passage_id: str):
+    """Mark a sidebar passage as shown for this session."""
+    rollup_file = get_rollup_file(session_id)
+    model = load_user_model(session_id)
+    
+    shown = set(model.get("shown_sidebar_passage_ids", []))
+    shown.add(passage_id)
+    model["shown_sidebar_passage_ids"] = list(shown)
+    
+    # Ensure rollup file directory exists
+    rollup_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(rollup_file, "w") as f:
+        f.write(json.dumps(model))
 
 
 def get_user_model_threads(session_id: str) -> list[str]:
@@ -280,6 +409,11 @@ def check_and_rollup_stale_session(session_id: str):
     
     Called on each request. If the last turn is older than
     SESSION_TIMEOUT_SECONDS, generates a rollup.
+    
+    NOTE: This runs synchronously in the request path. The rollup makes
+    an LLM call which can take several seconds. A user returning after
+    30 minutes of inactivity will experience a slow first response while
+    the rollup generates. Consider backgrounding this in production.
     """
     history = load_session_history(session_id)
     if not history:
@@ -364,6 +498,10 @@ def generate_session_rollup(session_id: str):
             "temperature": 0.3,
         }
         
+        # Add reasoning parameter for OpenRouter (if supported)
+        if llm_backend == "openrouter":
+            payload["reasoning"] = {"effort": "low"}
+        
         # Build headers (OpenRouter needs auth)
         headers = {}
         if llm_backend == "openrouter":
@@ -380,22 +518,28 @@ def generate_session_rollup(session_id: str):
             headers=headers,
         )
         resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        response_data = resp.json()
+        raw = response_data["choices"][0]["message"]["content"].strip()
         
-        # Strip markdown fences
-        if raw.startswith("```"):
-            raw = re.sub(r'^```\w*\n?', '', raw)
-            raw = re.sub(r'\n?```$', '', raw)
-            raw = raw.strip()
+        # Repair JSON response
+        repaired, was_truncated = repair_json_response(raw, response_data)
+        if was_truncated:
+            logger.warning("Session rollup response was truncated - JSON may be incomplete")
+        if not repaired:
+            raise ValueError("Empty JSON after repair")
         
-        result = json.loads(raw)
+        result = json.loads(repaired)
         
+        # Preserve shown tracking fields from existing model
+        existing_model = load_user_model(session_id)
         rollup = {
             "session_id": session_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "turn_count": len(history),
             "semantic_threads": result.get("semantic_threads", []),
             "themes": result.get("themes", []),
+            "shown_nan_yar_indices": existing_model.get("shown_nan_yar_indices", []),
+            "shown_sidebar_passage_ids": existing_model.get("shown_sidebar_passage_ids", []),
         }
         
         rollup_file = get_rollup_file(session_id)
@@ -409,13 +553,21 @@ def generate_session_rollup(session_id: str):
     
     except Exception as e:
         logger.error(f"Session rollup LLM call failed: {e}", exc_info=True)
+        if 'raw' in locals():
+            logger.error(f"Raw response (first 500 chars): {raw[:500]}")
         # Write a minimal rollup so we don't retry constantly
+        # NOTE: If LLM fails and there was no prior rollup, prev_threads will be []
+        # and we'll write an empty rollup with the current turn_count. This means
+        # we won't retry the rollup for those turns. This is acceptable (avoids
+        # infinite retry loops), but means rollup may be skipped for that session.
         rollup = {
             "session_id": session_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "turn_count": len(history),
             "semantic_threads": prev_threads,  # Keep previous if LLM fails
             "themes": existing_model.get("themes", []),
+            "shown_nan_yar_indices": existing_model.get("shown_nan_yar_indices", []),
+            "shown_sidebar_passage_ids": existing_model.get("shown_sidebar_passage_ids", []),
         }
         rollup_file = get_rollup_file(session_id)
         with open(rollup_file, "w") as f:
@@ -465,6 +617,10 @@ def filter_passage_with_llm(
     )
     
     try:
+        if llm_model_name == "unknown":
+            logger.error("Cannot filter passage: llm_model_name is 'unknown'. Check LLM configuration.")
+            return {"show": False, "confidence": 0.0, "reason": "LLM unavailable"}
+        
         # Build request payload
         payload = {
             "model": llm_model_name,
@@ -472,6 +628,10 @@ def filter_passage_with_llm(
             "max_tokens": 256,
             "temperature": 0.1,
         }
+        
+        # Add reasoning parameter for OpenRouter (if supported)
+        if llm_backend == "openrouter":
+            payload["reasoning"] = {"effort": "low"}
         
         # Build headers (OpenRouter needs auth)
         headers = {}
@@ -489,15 +649,17 @@ def filter_passage_with_llm(
             headers=headers,
         )
         resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        response_data = resp.json()
+        raw = response_data["choices"][0]["message"]["content"].strip()
         
-        # Strip markdown fences
-        if raw.startswith("```"):
-            raw = re.sub(r'^```\w*\n?', '', raw)
-            raw = re.sub(r'\n?```$', '', raw)
-            raw = raw.strip()
+        # Repair JSON response
+        repaired, was_truncated = repair_json_response(raw, response_data)
+        if was_truncated:
+            logger.warning("Passage filter response was truncated - JSON may be incomplete")
+        if not repaired:
+            raise ValueError("Empty JSON after repair")
         
-        result = json.loads(raw)
+        result = json.loads(repaired)
         
         return {
             "show": bool(result.get("show", False)),
@@ -507,6 +669,8 @@ def filter_passage_with_llm(
     
     except Exception as e:
         logger.error(f"Passage filter LLM call failed: {e}")
+        if 'raw' in locals():
+            logger.error(f"Raw response (first 500 chars): {raw[:500]}")
         # On failure, allow the passage through with low confidence
         return {"show": True, "confidence": 0.3, "reason": "filter unavailable"}
 
@@ -536,12 +700,21 @@ def filter_expand_with_llm(
     )
     
     try:
+        if llm_model_name == "unknown":
+            logger.error("Cannot filter expand: llm_model_name is 'unknown'. Check LLM configuration.")
+            return {"acceptable": False, "confidence": 0.0, "reason": "LLM unavailable",
+                    "rewrite_instruction": None}
+        
         payload = {
             "model": llm_model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 256,
             "temperature": 0.1,
         }
+        
+        # Add reasoning parameter for OpenRouter (if supported)
+        if llm_backend == "openrouter":
+            payload["reasoning"] = {"effort": "low"}
         
         headers = {}
         if llm_backend == "openrouter":
@@ -558,14 +731,17 @@ def filter_expand_with_llm(
             headers=headers,
         )
         resp.raise_for_status()
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        response_data = resp.json()
+        raw = response_data["choices"][0]["message"]["content"].strip()
         
-        if raw.startswith("```"):
-            raw = re.sub(r'^```\w*\n?', '', raw)
-            raw = re.sub(r'\n?```$', '', raw)
-            raw = raw.strip()
+        # Repair JSON response
+        repaired, was_truncated = repair_json_response(raw, response_data)
+        if was_truncated:
+            logger.warning("Expand filter response was truncated - JSON may be incomplete")
+        if not repaired:
+            raise ValueError("Empty JSON after repair")
         
-        result = json.loads(raw)
+        result = json.loads(repaired)
         
         return {
             "acceptable": bool(result.get("acceptable", False)),
@@ -576,6 +752,8 @@ def filter_expand_with_llm(
     
     except Exception as e:
         logger.error(f"Expand filter LLM call failed: {e}")
+        if 'raw' in locals():
+            logger.error(f"Raw response (first 500 chars): {raw[:500]}")
         # On failure, accept the expand
         return {"acceptable": True, "confidence": 0.3, "reason": "filter unavailable",
                 "rewrite_instruction": None}
@@ -613,50 +791,99 @@ def detect_llm_model():
 # ── Initialization ────────────────────────────────────────────────────
 
 def load_nan_yar_passages():
-    """Load Nan_Yar passages from file and pre-embed for personalized selection."""
+    """Load Ramana passages from nan-yar.txt, Ulladu_Narpadu.txt, and Upadesa_Undiyar.txt."""
     global nan_yar_passages, nan_yar_embeddings, nan_yar_embedder
     
-    nan_yar_path = Path(__file__).parent / "ramana" / "nan-yar.txt"
-    if not nan_yar_path.exists():
-        logger.warning(f"Nan_Yar file not found: {nan_yar_path}")
+    ramana_dir = Path(__file__).parent / "ramana"
+    all_passages = []  # List of dicts: {"text": str, "source": str}
+    
+    # Load passages from each file
+    source_files = [
+        ("nan-yar.txt", "Nan Yar"),
+        ("Ulladu_Narpadu.txt", "Ulladu Narpadu"),
+        ("Upadesa_Undiyar.txt", "Upadesa Undiyar"),
+    ]
+    
+    for filename, source_name in source_files:
+        file_path = ramana_dir / filename
+        if not file_path.exists():
+            logger.warning(f"{source_name} file not found: {file_path}")
+            continue
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Try splitting by double newline first, then single newline
+            passage_texts = [p.strip() for p in content.split('\n\n') if p.strip()]
+            if not passage_texts:
+                passage_texts = [p.strip() for p in content.split('\n') if p.strip()]
+            
+            # Store as dicts with source attribution
+            for text in passage_texts:
+                all_passages.append({"text": text, "source": source_name})
+            
+            logger.info(f"Loaded {len(passage_texts)} passages from {source_name}")
+        except Exception as e:
+            logger.error(f"Error loading {source_name}: {e}")
+            continue
+    
+    if not all_passages:
+        logger.warning("No Ramana passages loaded from any source")
         nan_yar_passages = []
+        nan_yar_embeddings = None
+        nan_yar_embedder = None
         return
     
-    with open(nan_yar_path, 'r', encoding='utf-8') as f:
-        content = f.read()
+    nan_yar_passages = all_passages
+    logger.info(f"Loaded {len(nan_yar_passages)} total Ramana passages")
     
-    passages = [p.strip() for p in content.split('\n\n') if p.strip()]
-    if not passages:
-        passages = [p.strip() for p in content.split('\n') if p.strip()]
-    
-    nan_yar_passages = passages
-    logger.info(f"Loaded {len(nan_yar_passages)} Nan_Yar passages")
-    
-    # Pre-embed for personalized selection
+    # Pre-embed for personalized selection (use text field for embedding)
     try:
         from sentence_transformers import SentenceTransformer
         import numpy as np
         import faiss
         
         nan_yar_embedder = SentenceTransformer("all-MiniLM-L6-v2")
-        embeddings = nan_yar_embedder.encode(nan_yar_passages, show_progress_bar=False)
+        passage_texts = [p["text"] for p in nan_yar_passages]
+        embeddings = nan_yar_embedder.encode(passage_texts, show_progress_bar=False)
         embeddings = np.array(embeddings).astype('float32')
         faiss.normalize_L2(embeddings)
         nan_yar_embeddings = embeddings
-        logger.info(f"Pre-embedded {len(nan_yar_passages)} Nan_Yar passages for personalized selection")
+        logger.info(f"Pre-embedded {len(nan_yar_passages)} Ramana passages for personalized selection")
     except Exception as e:
-        logger.warning(f"Could not pre-embed Nan_Yar passages (will use random): {e}")
+        logger.warning(f"Could not pre-embed Ramana passages (will use random): {e}")
         nan_yar_embeddings = None
         nan_yar_embedder = None
 
 
-def select_nan_yar_passage(session_id: str) -> str:
+def select_nan_yar_passage(session_id: str) -> dict:
     """
-    Select a Nan Yar passage. Personalized if user model exists,
-    otherwise random.
+    Select a Ramana passage (from Nan Yar, Ulladu Narpadu, or Upadesa Undiyar).
+    Personalized if user model exists, otherwise random.
+    Excludes passages already shown in this session.
+    
+    Returns:
+        {"text": str, "source": str}
     """
     if not nan_yar_passages:
-        return ""
+        return {"text": "", "source": ""}
+    
+    shown_indices = get_shown_nan_yar_indices(session_id)
+    available_indices = [i for i in range(len(nan_yar_passages)) if i not in shown_indices]
+    
+    # If all passages have been shown, reset and start over
+    if not available_indices:
+        logger.info(f"All Ramana passages shown for {session_id[:8]}..., resetting")
+        shown_indices.clear()
+        available_indices = list(range(len(nan_yar_passages)))
+        # Clear the shown list
+        rollup_file = get_rollup_file(session_id)
+        model = load_user_model(session_id)
+        model["shown_nan_yar_indices"] = []
+        rollup_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(rollup_file, "w") as f:
+            f.write(json.dumps(model))
     
     # Try personalized selection
     if nan_yar_embeddings is not None and nan_yar_embedder is not None:
@@ -672,20 +899,27 @@ def select_nan_yar_passage(session_id: str) -> str:
                 query_vec = np.mean(thread_vecs, axis=0, keepdims=True)
                 faiss.normalize_L2(query_vec)
                 
-                # Find nearest Nan Yar passage
+                # Find nearest Nan Yar passage (only from available)
                 similarities = query_vec @ nan_yar_embeddings.T
-                # Pick from top-3 randomly for some variety
-                top_k = min(3, len(nan_yar_passages))
-                top_indices = np.argsort(similarities[0])[-top_k:][::-1]
-                chosen_idx = random.choice(top_indices.tolist())
+                # Filter to available indices and get top-3
+                available_sims = [(similarities[0][i], i) for i in available_indices]
+                available_sims.sort(reverse=True)
+                top_k = min(3, len(available_sims))
+                top_indices = [idx for _, idx in available_sims[:top_k]]
+                chosen_idx = random.choice(top_indices)
                 
-                logger.info(f"Personalized Nan_Yar selection for {session_id[:8]}... "
-                           f"(sim={similarities[0][chosen_idx]:.3f})")
+                logger.info(f"Personalized Ramana passage selection for {session_id[:8]}... "
+                           f"(sim={similarities[0][chosen_idx]:.3f}, idx={chosen_idx})")
+                mark_nan_yar_shown(session_id, chosen_idx)
                 return nan_yar_passages[chosen_idx]
             except Exception as e:
-                logger.warning(f"Personalized Nan_Yar selection failed: {e}")
+                logger.warning(f"Personalized Ramana passage selection failed: {e}")
     
-    return random.choice(nan_yar_passages)
+    # Random selection from available
+    chosen_idx = random.choice(available_indices)
+    mark_nan_yar_shown(session_id, chosen_idx)
+    logger.info(f"Random Ramana passage selection for {session_id[:8]}... (idx={chosen_idx})")
+    return nan_yar_passages[chosen_idx]
 
 
 def initialize_generator():
@@ -711,7 +945,7 @@ def initialize_generator():
             rag_model = "anthropic/claude-sonnet-4"
         
         rag_provider = ContemplativeRAGProvider(
-            commentaries_path="./ramana/Commentaries_qa_excert.txt",
+            qa_jsonl_path="./ramana/src/ramana_qa_training.jsonl",
             backend=llm_backend,
             local_url=llm_url if llm_backend == "local" else None,
             model=rag_model,
@@ -745,10 +979,14 @@ def initialize_filtered_passages_rag():
         return
     
     try:
+        # NOTE: Unlike ContemplativeRAGProvider (which gets local_url=None for
+        # OpenRouter), FilteredPassagesRAG always receives llm_url directly.
+        # This is intentional — it uses llm_url for both backends.
         filtered_passages_rag = FilteredPassagesRAG(
             corpus_path=str(corpus_path),
             llm_url=llm_url,
             llm_model=llm_model,
+            llm_backend=llm_backend,
         )
         logger.info(f"FilteredPassagesRAG initialized successfully from {corpus_path} (backend={llm_backend})")
     except Exception as e:
@@ -817,17 +1055,21 @@ def index():
 
 @app.route('/api/nan-yar', methods=['GET'])
 def get_nan_yar():
-    """Get a Nan_Yar passage, personalized if user model exists."""
+    """Get a Ramana passage (from Nan Yar, Ulladu Narpadu, or Upadesa Undiyar), personalized if user model exists."""
     if not nan_yar_passages:
-        return jsonify({'error': 'No Nan_Yar passages loaded'}), 500
+        return jsonify({'error': 'No Ramana passages loaded'}), 500
     
     session_id = get_or_create_session_id()
     
     # Check for stale session and trigger rollup if needed
     check_and_rollup_stale_session(session_id)
     
-    passage = select_nan_yar_passage(session_id)
-    return jsonify({'passage': passage})
+    passage_data = select_nan_yar_passage(session_id)
+    resp = make_response(jsonify({
+        'passage': passage_data.get('text', ''),
+        'source': passage_data.get('source', '')
+    }))
+    return set_session_cookie(resp, session_id)
 
 
 @app.route('/api/query', methods=['POST'])
@@ -1038,11 +1280,23 @@ def retrieve_passages():
         if not candidates:
             return jsonify({'passages': []})
         
+        # Filter out already-shown passages
+        shown_passage_ids = get_shown_sidebar_passage_ids(session_id)
+        available_candidates = [
+            c for c in candidates 
+            if c.get("passage_id") not in shown_passage_ids
+        ]
+        
+        if not available_candidates:
+            logger.info(f"All candidate passages already shown for {session_id[:8]}...")
+            # If all candidates were shown, allow repeats (but still prefer unshown if any)
+            available_candidates = candidates
+        
         # LLM post-filter: rate each candidate
         best_passage = None
         best_confidence = 0.0
         
-        for candidate in candidates:
+        for candidate in available_candidates:
             verdict = filter_passage_with_llm(
                 passage=candidate,
                 user_input=user_input,
@@ -1065,8 +1319,11 @@ def retrieve_passages():
         # Apply minimum confidence threshold
         MIN_CONFIDENCE = 0.5
         if best_passage and best_confidence >= MIN_CONFIDENCE:
+            passage_id = best_passage.get('passage_id')
+            mark_sidebar_passage_shown(session_id, passage_id)
+            
             formatted = {
-                'passage_id': best_passage.get('passage_id'),
+                'passage_id': passage_id,
                 'text': best_passage.get('text', ''),
                 'author': best_passage.get('author', 'Unknown'),
                 'title': best_passage.get('title', 'Untitled'),
@@ -1152,9 +1409,13 @@ if __name__ == '__main__':
     
     logger.info("Initializing Ramana API server...")
     load_nan_yar_passages()
+    # Detect model early so llm_model_name is set before filter functions need it
+    detect_llm_model()
+    if llm_model_name == "unknown":
+        logger.error("LLM model detection failed and no model specified. Filter functions will fail.")
+        logger.error("Please specify --llm-model or ensure local vLLM is running.")
     initialize_generator()
     initialize_filtered_passages_rag()
-    detect_llm_model()
     
     # Ensure sessions directory exists
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)

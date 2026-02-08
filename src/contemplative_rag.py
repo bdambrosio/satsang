@@ -101,7 +101,8 @@ class ContemplativeRAGProvider:
     def __init__(
         self,
         jsonl_path: Optional[str] = None,  # Optional - kept for future merging
-        commentaries_path: Optional[str] = "./ramana/Commentaries_qa_excert.txt",
+        commentaries_path: Optional[str] = None,  # Deprecated: use qa_jsonl_path
+        qa_jsonl_path: Optional[str] = "./ramana/src/ramana_qa_training.jsonl",
         backend: str = "local",  # "local" or "openrouter"
         model: Optional[str] = None,
         local_url: str = "http://localhost:5000/v1",
@@ -115,7 +116,8 @@ class ContemplativeRAGProvider:
         
         Args:
             jsonl_path: Path to Talks-parsed_reviewed.jsonl (optional - kept for future merging)
-            commentaries_path: Path to Commentaries_qa_excert.txt (default: ./ramana/Commentaries_qa_excert.txt)
+            commentaries_path: DEPRECATED. Path to Commentaries_qa_excert.txt (still works as fallback)
+            qa_jsonl_path: Path to ramana_qa_training.jsonl (default: ./ramana/src/ramana_qa_training.jsonl)
             backend: "local" (vLLM) or "openrouter"
             model: Model name (optional - defaults to "anthropic/claude-sonnet-4" for openrouter)
             local_url: Local vLLM API URL
@@ -147,19 +149,26 @@ class ContemplativeRAGProvider:
         self.face_to_face_passages = []
         self.face_to_face_index = None
         
-        if commentaries_path:
-            logger.info(f"Loading Commentaries from {commentaries_path}")
+        if qa_jsonl_path and Path(qa_jsonl_path).exists():
+            logger.info(f"Loading Commentaries Q&A from {qa_jsonl_path}")
+            qa, teachings = self._load_qa_jsonl(qa_jsonl_path)
+            self.qa_pairs = qa
+            self.face_to_face_passages = teachings
+            logger.info(f"Loaded {len(self.qa_pairs)} Q&A pairs and {len(self.face_to_face_passages)} teachings from JSONL")
+        elif commentaries_path and Path(commentaries_path).exists():
+            # Fallback to old txt format
+            logger.info(f"Loading Commentaries from {commentaries_path} (legacy format)")
             commentaries_qa, commentaries_passages = self._load_commentaries(commentaries_path)
             self.qa_pairs = commentaries_qa
             self.face_to_face_passages = commentaries_passages
             logger.info(f"Loaded {len(self.qa_pairs)} Q&A pairs and {len(self.face_to_face_passages)} passages from Commentaries")
         elif jsonl_path:
-            # Fallback to JSONL if Commentaries not provided (kept for future merging)
+            # Fallback to Talks JSONL
             logger.info(f"Loading Q&A pairs from JSONL: {jsonl_path}")
             self.qa_pairs = self._load_qa_pairs(jsonl_path)
             logger.info(f"Loaded {len(self.qa_pairs)} Q&A pairs from JSONL")
         else:
-            logger.warning("No data source provided (neither commentaries_path nor jsonl_path)")
+            logger.warning("No data source provided")
         
         # Build FAISS index for Q&A pairs
         if self.qa_pairs:
@@ -280,6 +289,97 @@ Focus always on Ramana Maharshi's teachings as given in Nam Yar:
                 })
         
         return results
+    
+    def _load_qa_jsonl(self, jsonl_path: str) -> tuple[list[dict], list[str]]:
+        """
+        Load Q&A pairs and teachings from ramana_qa_training.jsonl.
+        
+        Entry types:
+        - direct_qa / reported_exchange: {"ref", "type", "question", "answer", "tags"}
+        - multi_turn: {"ref", "type", "turns": [{"role", "text"}, ...], "tags"}
+        - teaching: {"ref", "type", "text", "tags"}
+        
+        Returns:
+            (qa_pairs, teachings) where:
+            - qa_pairs: list of {"question": str, "answer": str, "source_id": str, "tags": list}
+            - teachings: list of passage strings
+        """
+        qa_pairs = []
+        teachings = []
+        path = Path(jsonl_path)
+        
+        if not path.exists():
+            logger.warning(f"Q&A JSONL file not found: {jsonl_path}")
+            return qa_pairs, teachings
+        
+        with open(path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Skipping invalid JSON at line {line_num}: {e}")
+                    continue
+                
+                entry_type = entry.get("type", "")
+                ref = entry.get("ref", f"line_{line_num}")
+                tags = entry.get("tags", [])
+                
+                if entry_type in ("direct_qa", "reported_exchange"):
+                    question = entry.get("question", "").strip()
+                    answer = entry.get("answer", "").strip()
+                    if question and answer:
+                        qa_pairs.append({
+                            "question": question,
+                            "answer": answer,
+                            "source_id": ref,
+                            "tags": tags,
+                        })
+                
+                elif entry_type == "multi_turn":
+                    turns = entry.get("turns", [])
+                    if not turns:
+                        continue
+                    # First questioner turn(s) as question, Ramana turn(s) as answer
+                    q_parts = []
+                    a_parts = []
+                    for turn in turns:
+                        role = turn.get("role", "")
+                        text = turn.get("text", "").strip()
+                        if not text:
+                            continue
+                        if role == "questioner":
+                            # Only use questioner turns before first Ramana turn as question
+                            if not a_parts:
+                                q_parts.append(text)
+                            # After Ramana has spoken, additional questioner turns
+                            # contribute to answer context
+                            else:
+                                a_parts.append(f"Q: {text}")
+                        elif role == "ramana":
+                            a_parts.append(text)
+                    
+                    question = " ".join(q_parts).strip()
+                    answer = "\n".join(a_parts).strip()
+                    if question and answer:
+                        qa_pairs.append({
+                            "question": question,
+                            "answer": answer,
+                            "source_id": ref,
+                            "tags": tags,
+                        })
+                
+                elif entry_type == "teaching":
+                    text = entry.get("text", "").strip()
+                    # Skip short or clearly editorial entries
+                    if text and len(text) > 50:
+                        teachings.append(text)
+        
+        logger.info(f"Parsed {len(qa_pairs)} Q&A pairs and {len(teachings)} teachings from {jsonl_path}")
+        return qa_pairs, teachings
     
     def _load_commentaries(self, txt_path: str) -> tuple[list[dict], list[str]]:
         """

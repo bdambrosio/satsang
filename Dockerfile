@@ -25,7 +25,9 @@ COPY static/ ./static/
 
 # Copy data files
 COPY ramana/nan-yar.txt ./ramana/
-COPY ramana/Commentaries_qa_excert.txt ./ramana/
+COPY ramana/Ulladu_Narpadu.txt ./ramana/
+COPY ramana/Upadesa_Undiyar.txt ./ramana/
+COPY ramana/src/ramana_qa_training.jsonl ./ramana/src/
 
 # Copy filtered passages corpus
 COPY filtered_guten/filtered_passages/corpus.jsonl ./filtered_guten/filtered_passages/
