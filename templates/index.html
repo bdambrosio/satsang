@@ -9,7 +9,8 @@
 <body>
     <div class="container">
         <header>
-            <h1>Ramana Maharshi</h1>
+            <h1>In Honor of Bhagavan</h1>
+            <a href="/about" class="about-link">About this site</a>
         </header>
 
         <!-- Nan_Yar Passage Section -->
@@ -190,6 +191,34 @@
             return div.innerHTML;
         }
 
+        // ── Process bracketed glosses in passage text ──
+        // Two-pass approach:
+        //   Pass 1: word [gloss] → dotted-underline word with tooltip
+        //   Pass 2: remaining standalone [comment] → lighter inline text
+        function processGlosses(text) {
+            // First escape HTML in the raw text
+            const escaped = escapeHtml(text);
+            // Replace newlines with <br>
+            let result = escaped.replace(/\n/g, '<br>');
+            // Pass 1: word immediately before [gloss] — tooltip on the word
+            result = result.replace(
+                /([\w\u00C0-\u024F\u1E00-\u1EFF''\u2019]+)\s*\[([^\]]+)\]/g,
+                function(match, word, gloss) {
+                    return '<span class="gloss-word" data-gloss="' +
+                        gloss.replace(/"/g, '&quot;') +
+                        '">' + word + '</span>';
+                }
+            );
+            // Pass 2: any remaining [brackets] are standalone translator insertions
+            result = result.replace(
+                /\[([^\]]+)\]/g,
+                function(match, gloss) {
+                    return '<span class="gloss-standalone">[' + gloss + ']</span>';
+                }
+            );
+            return result;
+        }
+
         // ── Load Nan_Yar passage ──
         async function loadNanYar() {
             try {
@@ -197,7 +226,7 @@
                 const data = await response.json();
                 
                 if (data.passage) {
-                    let html = '<p>' + data.passage.replace(/\n/g, '<br>') + '</p>';
+                    let html = '<p>' + processGlosses(data.passage) + '</p>';
                     if (data.source) {
                         html += '<p class="passage-source">— ' + escapeHtml(data.source) + '</p>';
                     }
@@ -370,6 +399,19 @@
         }
 
         // ── Shared: fetch passages ──
+        function renderPassage(passage) {
+            return `
+                <div class="passage-item">
+                    <div class="passage-meta">
+                        <span class="passage-author">${escapeHtml(passage.author || 'Unknown')}</span>
+                        <span class="passage-title">${escapeHtml(passage.title || 'Untitled')}</span>
+                        ${passage.tradition ? `<span class="passage-tradition">${escapeHtml(passage.tradition)}</span>` : ''}
+                    </div>
+                    <div class="passage-text">${escapeHtml(passage.text)}</div>
+                </div>
+            `;
+        }
+
         async function fetchPassages(query, responseText, expandedText) {
             document.getElementById('passages-list').innerHTML = 
                 '<p class="loading-message">Finding related passage...</p>';
@@ -395,21 +437,31 @@
                     return;
                 }
                 
-                let html = '';
-                passages.forEach((passage) => {
-                    html += `
-                        <div class="passage-item">
-                            <div class="passage-meta">
-                                <span class="passage-author">${escapeHtml(passage.author || 'Unknown')}</span>
-                                <span class="passage-title">${escapeHtml(passage.title || 'Untitled')}</span>
-                                ${passage.tradition ? `<span class="passage-tradition">${escapeHtml(passage.tradition)}</span>` : ''}
-                            </div>
-                            <div class="passage-text">${escapeHtml(passage.text)}</div>
-                        </div>
-                    `;
-                });
+                // Show first passage + "Another voice" button if alternate exists
+                let html = renderPassage(passages[0]);
+                
+                if (passages.length > 1) {
+                    html += '<button class="another-voice-btn" id="another-voice-btn">Another voice</button>';
+                    // Store alternate for swap
+                    window._alternatePassage = passages[1];
+                    window._primaryPassage = passages[0];
+                    window._showingAlternate = false;
+                }
                 
                 document.getElementById('passages-list').innerHTML = html;
+                
+                if (passages.length > 1) {
+                    document.getElementById('another-voice-btn').addEventListener('click', function() {
+                        window._showingAlternate = !window._showingAlternate;
+                        const toShow = window._showingAlternate ? window._alternatePassage : window._primaryPassage;
+                        const listEl = document.getElementById('passages-list');
+                        listEl.innerHTML = renderPassage(toShow) +
+                            '<button class="another-voice-btn" id="another-voice-btn">' +
+                            (window._showingAlternate ? 'Back' : 'Another voice') + '</button>';
+                        // Re-attach listener
+                        document.getElementById('another-voice-btn').addEventListener('click', arguments.callee);
+                    });
+                }
                 
             } catch (error) {
                 console.error('Error retrieving passages:', error);
@@ -418,6 +470,16 @@
             }
         }
         
+        // ── Tap-to-show glosses on mobile ──
+        document.addEventListener('click', function(e) {
+            // Close any open gloss
+            document.querySelectorAll('.gloss-active').forEach(el => el.classList.remove('gloss-active'));
+            // If tapped a gloss-word, toggle it
+            if (e.target.classList.contains('gloss-word')) {
+                e.target.classList.add('gloss-active');
+            }
+        });
+
         // Load Nan_Yar on page load
         loadNanYar();
     </script>

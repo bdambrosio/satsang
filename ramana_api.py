@@ -168,16 +168,18 @@ SESSION_TIMEOUT_SECONDS = 30 * 60
 PASSAGE_FILTER_PROMPT = """You are curating a sidebar passage for a website devoted to Ramana Maharshi's teachings. A user asked a question and received a response. You must judge whether a candidate passage from another contemplative tradition would deepen the reader's understanding of the response, or risk confusing, misleading, or contradicting them.
 
 The passage should:
-- Illuminate the SAME experiential territory as the response, from a different angle
+- Illuminate the SAME experiential territory as the response, from a different angle or tradition
 - Be coherent with the response's meaning (not contradict or undermine it)
 - Be accessible enough that the reader can connect it to the dialogue
 - Add genuine contemplative depth, not merely repeat the same idea in different words
+- Carry comparable contemplative weight — devotion, detachment, surrender, and stillness are all valid complementary angles to self-inquiry when they point toward the same depth
 
 The passage should NOT:
 - Contradict the core pointing of the response
 - Introduce confusing terminology or concepts that would distract
 - Be so tangential that the connection requires specialist knowledge
 - Present a fundamentally different path in a way that muddies the response
+- Come from a shallow or motivational register that lacks genuine contemplative depth (e.g. self-help, pop-spiritual, or inspirational language when the dialogue is pointing at awareness or self-inquiry)
 
 DIALOGUE:
 Question: {user_input}
@@ -186,7 +188,7 @@ Response: {response}
 
 Expanded: {expanded_response}
 
---- CANDIDATE PASSAGE ---
+--- CANDIDATE PASSAGE (contemplative depth: {passage_depth}/3) ---
 {passage_text}
 --- {passage_author}, {passage_title} ({passage_tradition}) ---
 
@@ -614,6 +616,7 @@ def filter_passage_with_llm(
         passage_author=passage.get("author", "Unknown"),
         passage_title=passage.get("title", "Untitled"),
         passage_tradition=passage.get("tradition", "unknown"),
+        passage_depth=passage.get("doc_contemplative_depth", 2),
     )
     
     try:
@@ -1053,6 +1056,12 @@ def index():
     return set_session_cookie(resp, session_id)
 
 
+@app.route('/about')
+def about():
+    """Serve the about page."""
+    return render_template('about.html')
+
+
 @app.route('/api/nan-yar', methods=['GET'])
 def get_nan_yar():
     """Get a Ramana passage (from Nan Yar, Ulladu Narpadu, or Upadesa Undiyar), personalized if user model exists."""
@@ -1263,13 +1272,14 @@ def retrieve_passages():
     user_context = get_user_context_for_prompt(session_id)
     
     try:
-        # Over-retrieve candidates
+        # Over-retrieve candidates (16 to allow a retry round if first 8 all rejected)
+        BATCH_SIZE = 8
         candidates = filtered_passages_rag.retrieve_with_rewrite(
             user_input=user_input,
             response=response,
             expanded_response=expanded_response,
             user_context=user_context,
-            top_k=8,
+            top_k=BATCH_SIZE * 2,
         )
         logger.info(f"Retrieved {len(candidates)} candidate passages")
         
@@ -1285,55 +1295,90 @@ def retrieve_passages():
         
         if not available_candidates:
             logger.info(f"All candidate passages already shown for {session_id[:8]}...")
-            # If all candidates were shown, allow repeats (but still prefer unshown if any)
             available_candidates = candidates
         
-        # LLM post-filter: rate each candidate
-        best_passage = None
-        best_confidence = 0.0
-        
-        for candidate in available_candidates:
-            verdict = filter_passage_with_llm(
-                passage=candidate,
-                user_input=user_input,
-                response=response,
-                expanded_response=expanded_response,
-                user_context=user_context,
-            )
-            
-            pid = candidate.get("passage_id", "?")
-            logger.info(f"  Filter {pid}: show={verdict['show']}, "
-                       f"confidence={verdict['confidence']:.2f}, "
-                       f"reason={verdict['reason']}")
-            
-            if verdict["show"] and verdict["confidence"] > best_confidence:
-                best_confidence = verdict["confidence"]
-                best_passage = candidate
-                best_passage["_filter_reason"] = verdict["reason"]
-                best_passage["_filter_confidence"] = verdict["confidence"]
-        
-        # Apply minimum confidence threshold
+        # LLM post-filter in rounds: collect all passing passages
         MIN_CONFIDENCE = 0.5
-        if best_passage and best_confidence >= MIN_CONFIDENCE:
-            passage_id = best_passage.get('passage_id')
-            mark_sidebar_passage_shown(session_id, passage_id)
+        passing = []  # list of (confidence, candidate)
+        
+        for round_num in range(2):
+            batch_start = round_num * BATCH_SIZE
+            batch = available_candidates[batch_start:batch_start + BATCH_SIZE]
+            if not batch:
+                break
             
-            formatted = {
-                'passage_id': passage_id,
-                'text': best_passage.get('text', ''),
-                'author': best_passage.get('author', 'Unknown'),
-                'title': best_passage.get('title', 'Untitled'),
-                'tradition': best_passage.get('tradition', 'unknown'),
-                'themes': best_passage.get('themes', []),
-                'similarity': best_passage.get('similarity', 0.0),
-            }
-            logger.info(f"Selected passage {formatted['passage_id']} "
-                       f"(confidence={best_confidence:.2f})")
-            return jsonify({'passages': [formatted]})
-        else:
-            logger.info(f"No passage met confidence threshold "
-                       f"(best={best_confidence:.2f}, min={MIN_CONFIDENCE})")
+            if round_num > 0:
+                logger.info(f"Retry round {round_num + 1}: filtering next {len(batch)} candidates")
+            
+            for candidate in batch:
+                verdict = filter_passage_with_llm(
+                    passage=candidate,
+                    user_input=user_input,
+                    response=response,
+                    expanded_response=expanded_response,
+                    user_context=user_context,
+                )
+                
+                pid = candidate.get("passage_id", "?")
+                logger.info(f"  Filter {pid}: show={verdict['show']}, "
+                           f"confidence={verdict['confidence']:.2f}, "
+                           f"reason={verdict['reason']}")
+                
+                if verdict["show"] and verdict["confidence"] >= MIN_CONFIDENCE:
+                    candidate["_filter_reason"] = verdict["reason"]
+                    candidate["_filter_confidence"] = verdict["confidence"]
+                    passing.append((verdict["confidence"], candidate))
+            
+            # If we found at least one good passage, stop
+            if passing:
+                break
+        
+        if not passing:
+            logger.info(f"No passage met confidence threshold after all rounds")
             return jsonify({'passages': []})
+        
+        # Sort by confidence descending
+        passing.sort(key=lambda x: x[0], reverse=True)
+        
+        best_confidence, best_passage = passing[0]
+        
+        # Pick an alternate: prefer different tradition or author from best
+        best_tradition = best_passage.get('tradition')
+        best_author = best_passage.get('author')
+        alternate = None
+        for conf, cand in passing[1:]:
+            if cand.get('tradition') != best_tradition or cand.get('author') != best_author:
+                alternate = cand
+                break
+        # If no diversity alternate found, just take second-best
+        if alternate is None and len(passing) > 1:
+            alternate = passing[1][1]
+        
+        def format_passage(p):
+            return {
+                'passage_id': p.get('passage_id'),
+                'text': p.get('text', ''),
+                'author': p.get('author', 'Unknown'),
+                'title': p.get('title', 'Untitled'),
+                'tradition': p.get('tradition', 'unknown'),
+                'themes': p.get('themes', []),
+                'similarity': p.get('similarity', 0.0),
+            }
+        
+        mark_sidebar_passage_shown(session_id, best_passage.get('passage_id'))
+        result = [format_passage(best_passage)]
+        
+        if alternate:
+            mark_sidebar_passage_shown(session_id, alternate.get('passage_id'))
+            result.append(format_passage(alternate))
+            logger.info(f"Selected passage {result[0]['passage_id']} "
+                       f"(confidence={best_confidence:.2f}) "
+                       f"+ alternate {result[1]['passage_id']}")
+        else:
+            logger.info(f"Selected passage {result[0]['passage_id']} "
+                       f"(confidence={best_confidence:.2f}), no alternate")
+        
+        return jsonify({'passages': result})
     
     except Exception as e:
         logger.error(f"Error retrieving passages: {e}", exc_info=True)

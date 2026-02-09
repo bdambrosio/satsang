@@ -103,6 +103,8 @@ def repair_json_response(raw: str, response_obj: dict = None) -> tuple[str, bool
     extracted = extracted.strip()
     
     return extracted, was_truncated
+import math
+from collections import Counter
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
@@ -219,6 +221,7 @@ class FilteredPassagesRAG:
         self._load_corpus()
         if self.passages:
             self._build_index()
+            self._compute_author_frequencies()
     
     def _detect_llm_model(self) -> str:
         """Auto-detect model from local vLLM API."""
@@ -307,6 +310,50 @@ class FilteredPassagesRAG:
         self.index.add(embeddings)
         
         logger.info(f"FAISS index built: {self.index.ntotal} vectors from {len(self.passages)} passages")
+    
+    # ── Depth and author-frequency weights for retrieval scoring ──────
+    
+    # Depth weights: depth 3 (direct pointing) gets full credit,
+    # lower depths are gently dampened.
+    DEPTH_WEIGHTS = {3: 1.0, 2: 0.88, 1: 0.72}
+    
+    # Author frequency cap: no single author should dominate retrieval.
+    # Authors above this share of the corpus get dampened.
+    AUTHOR_FREQ_CAP = 0.04  # 4%
+    
+    def _compute_author_frequencies(self):
+        """Compute per-author frequency dampening factors.
+        
+        Uses sqrt dampening: factor = sqrt(cap / share).
+        This is gentler than linear (cap/share) -- a strongly
+        over-represented author is dampened but not buried.
+        """
+        counts = Counter(p.get('author', '') for p in self.passages)
+        total = len(self.passages)
+        
+        self.author_dampening = {}
+        for author, count in counts.items():
+            share = count / total
+            if share > self.AUTHOR_FREQ_CAP:
+                self.author_dampening[author] = math.sqrt(self.AUTHOR_FREQ_CAP / share)
+            # Authors at or below cap get factor 1.0 (no entry needed)
+        
+        if self.author_dampening:
+            dampened = sorted(self.author_dampening.items(), key=lambda x: x[1])
+            for author, factor in dampened:
+                logger.info(f"  Author frequency dampening: {author or '(empty)'} "
+                           f"({counts[author]} passages, {100*counts[author]/total:.1f}%) "
+                           f"→ factor {factor:.3f}")
+    
+    def _score_passage(self, passage: dict, raw_similarity: float) -> float:
+        """Apply depth weight and author frequency dampening to raw similarity."""
+        depth = passage.get('doc_contemplative_depth', 2)
+        depth_w = self.DEPTH_WEIGHTS.get(depth, 0.88)
+        
+        author = passage.get('author', '')
+        author_w = self.author_dampening.get(author, 1.0)
+        
+        return raw_similarity * depth_w * author_w
     
     def rewrite_query_as_threads(
         self,
@@ -539,18 +586,25 @@ class FilteredPassagesRAG:
                     if passage_id not in best_by_passage or sim > best_by_passage[passage_id][0]:
                         best_by_passage[passage_id] = (sim, passage)
             
-            # Sort by similarity and take top_k
+            # Apply depth weight and author frequency dampening, then rank
             results = []
             for passage_id, (sim, passage) in best_by_passage.items():
+                scored = self._score_passage(passage, sim)
                 results.append({
                     **passage,
-                    'similarity': sim,
+                    'similarity': scored,
+                    '_raw_similarity': sim,
                 })
             
             results.sort(key=lambda x: x['similarity'], reverse=True)
             results = results[:top_k]
             
             logger.info(f"Found {len(results)} passages after merging across {len(query_texts)} queries")
+            for r in results[:3]:
+                logger.info(f"  {r.get('passage_id')}: raw={r.get('_raw_similarity', 0):.3f} "
+                           f"scored={r['similarity']:.3f} "
+                           f"depth={r.get('doc_contemplative_depth')} "
+                           f"author={r.get('author', '')[:30]}")
             
             return results
         
