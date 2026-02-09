@@ -851,17 +851,22 @@ class ContemplativeGenerator:
         # Mode-aware style instruction
         if mode == "conversational":
             style_instruction = (
-                "Do NOT repeat the original response. Write 3-5 sentences that make the "
-                "response more accessible. Speak as a patient companion who has spent time "
-                "with these teachings. Use concrete language and, where helpful, a brief "
-                "example or analogy. Do not lecture or prescribe."
+                "Do NOT repeat the original response. Write 3-5 sentences that make "
+                "the pointing more concrete—closer to the bone. If the response is "
+                "abstract, bring it to earth. If it asks a question, let the question "
+                "land harder. Use simple language, sometimes an analogy, sometimes a "
+                "restatement. Do not resolve or complete the pointing. Do not wrap it "
+                "up neatly. Leave the reader with more to sit with, not less. "
+                "Do not explain or summarize. Do not lecture or prescribe."
             )
         else:
             style_instruction = (
-                "Do NOT repeat the original response, the goal it to make it more "
-                "accessible to those not familiar with all of Bhagavan's teachings. "
-                "Write 2 - 3 sentences, in the more informal style of Bhagavan's "
-                "statements in the Commentaries passages included above."
+                "Do NOT repeat the original response. Write 2-3 sentences that make "
+                "the pointing more concrete—closer to the bone. If the response is "
+                "abstract, bring it to earth. If it asks a question, let the question "
+                "land harder. Do not resolve or complete the pointing. Do not wrap it "
+                "up neatly. Leave the reader with more to sit with, not less. "
+                "Do not explain or summarize."
             )
         
         # Check if RAG provider is available and has passages access
@@ -875,8 +880,19 @@ class ContemplativeGenerator:
             # Use RAG provider with Commentaries passages
             commentaries_passages = self.inference_provider.query_passages(query+'. '+response, top_n=4 )
             
-            # Build expansion prompt - add generated_response and ask for longer, less abstract response
-            prompt_parts = ["You are a helpful assistant expanding on a response to a user query."]
+            # Build expansion prompt
+            prompt_parts = ["You are making a brief contemplative response more concrete—closer to the bone—in the spirit of Ramana Maharshi's Commentaries. Do not explain or summarize. Do not resolve or complete the pointing. Leave the reader with more to sit with, not less."]
+            prompt_parts.append("")
+            prompt_parts.append("#Examples from Talks with Sri Ramana Maharshi:")
+            prompt_parts.append("Q: How is one to realize the Self?")
+            prompt_parts.append("Bhagavan: Whose Self? Find out.")
+            prompt_parts.append("Q: How to know the 'Real I' as distinct from the 'false I'?")
+            prompt_parts.append("Bhagavan: Is there anyone who is not aware of himself? Each one knows, but yet does not know, the Self. A strange paradox.")
+            prompt_parts.append("Q: How long does it take a man to be reborn after death?")
+            prompt_parts.append("Bhagavan: Perhaps you are born now — why think of other births? The fact is there is neither birth nor death. Let him who is born think of death and palliatives for it.")
+            prompt_parts.append("Q: I want to know the state of liberation.")
+            prompt_parts.append("Bhagavan: You should know your present state first. What do you know of your present state? If you know the present state, knowledge of any other state will be clear.")
+            prompt_parts.append("")
             prompt_parts.append("Original query:")
             prompt_parts.append(query)
             prompt_parts.append("")
@@ -884,7 +900,7 @@ class ContemplativeGenerator:
             prompt_parts.append(response)
             prompt_parts.append("")
             
-            prompt_parts.append("Nam Yar is a core text of Bhagavan's teachings:")
+            prompt_parts.append("Nan Yar is a core text of Bhagavan's teachings:")
             prompt_parts.append(NAN_YAR)
             prompt_parts.append("")
             if commentaries_passages:
@@ -893,7 +909,7 @@ class ContemplativeGenerator:
                     prompt_parts.append(passage)
                     prompt_parts.append("")
             
-            prompt_parts.append("Expand on the original response into a longer, less abstract form, in the style of the Commentaries passages included above")
+            prompt_parts.append("Make the initial response more concrete, in the spirit of the examples and passages above. Do not complete or resolve the pointing.")
             prompt_parts.append("")
             prompt_parts.append("Original query:")
             prompt_parts.append(query)
@@ -927,15 +943,17 @@ class ContemplativeGenerator:
                 expand_prompt = f"""Original response:
 {response}
 
-Expand this into a longer, more accessible response drawing from Ramana Maharshi's teachings. 
-Speak as a patient companion. Use concrete language and, where helpful, a brief example 
-or analogy. Do not lecture or prescribe. Write 3-5 sentences."""
+Make this more concrete—closer to the bone—in 3-5 sentences. If the response is abstract, 
+bring it to earth. If it asks a question, let the question land harder. Use simple language, 
+sometimes an analogy. Do not resolve or complete the pointing. Do not wrap it up neatly. 
+Leave the reader with more to sit with, not less. Do not lecture or prescribe."""
             else:
                 expand_prompt = f"""Original response:
 {response}
 
-Expand this into a longer, less abstract response in the style of Ramana Maharshi's teachings from Face_to_Face. 
-Maintain the direct, pointing style. Make it more concrete and less abstract."""
+Make this more concrete—closer to the bone—in 2-3 sentences. If the response is abstract, 
+bring it to earth. If it asks a question, let the question land harder. Do not resolve or 
+complete the pointing. Leave the reader with more to sit with, not less."""
             
             messages = [{"role": "user", "content": expand_prompt}]
             
